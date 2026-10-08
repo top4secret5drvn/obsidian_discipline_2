@@ -196,3 +196,15 @@ pre.block-language-lifetracker-day,
 .lt-locked { opacity: 0.5; color: var(--text-muted); }
 .lt-notice { background: var(--background-secondary); border-left: 3px solid var(--interactive-accent); padding: 8px 12px; margin: 8px 0; border-radius: 4px; font-size: 13px; }
 .lt-description { font-size: 12px; color: var(--text-muted); font-style: italic; margin-top: 2px; width: 100%; }
+/* ---------- курсы ---------- */
+.lt-row .lt-bar {
+  max-width: 140px;
+}
+
+.lt-row .lt-name {
+  cursor: pointer;
+}
+
+.lt-row button {
+  flex-shrink: 0;
+}

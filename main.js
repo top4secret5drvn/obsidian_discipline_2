@@ -192,11 +192,16 @@ return lvl;
 }
 async function computeTotalStats(store) {
 const total = zeroStats();
+
 for (const d of await store.listDays()) {
 const day = await store.loadDay(d);
 const s = computeDayStats(store.ref, day).stats;
 for (const [k] of STATS) total[k] += s[k];
 }
+
+const courseStats = computeCourseStats(store.coursesData?.courses || []);
+for (const [k] of STATS) total[k] += courseStats[k];
+
 return total;
 }
 function getStatTitle(statKey, statValue, config = {}) {
@@ -362,6 +367,7 @@ this.ref = null;
 this.work = null;
 this.cache = {};
 this.rewardsData = null;
+this.coursesData = null;
 }
 async init() {
 await this.a.mkdir(this.base).catch(() => {});
@@ -385,10 +391,27 @@ if (rawData.currency === undefined || typeof rawData.currency !== 'number') rawD
 if (rawData.unlockedSlots === undefined || typeof rawData.unlockedSlots !== 'number') rawData.unlockedSlots = 0;
 this.rewardsData = rawData;
 if (!await this.a.exists(rp)) await this.saveRewards();
+
+const cp = this.base + '/courses.json';
+this.coursesData = await this.a.exists(cp)
+  ? JSON.parse(await this.a.read(cp))
+  : { schemaVersion: 1, courses: [] };
+
+if (!Array.isArray(this.coursesData.courses)) {
+  this.coursesData.courses = [];
+}
+
+if (!await this.a.exists(cp)) {
+  await this.saveCourses();
+}
 }
 dayPath(d) { return this.base + '/journal/' + d + '.json'; }
 workPath() { return this.base + '/workItems.json'; }
 rewardsPath() { return this.base + '/rewards.json'; }
+coursesPath() { return this.base + '/courses.json'; }
+async saveCourses() {
+  await this.a.write(this.coursesPath(), JSON.stringify(this.coursesData, null, 2));
+}
 emptyDay(date) {
 return {
 schemaVersion: 1,
@@ -587,12 +610,17 @@ return xp;
 }
 async function computeTotalXP(store) {
 let totalXP = 0;
+
 const days = await store.listDays();
 const workItems = store.work?.items || [];
+
 for (const date of days) {
 const day = await store.loadDay(date);
 totalXP += computeDayXP(store.ref, day, workItems);
 }
+
+totalXP += courseXPTotal(store.coursesData?.courses || []);
+
 return totalXP;
 }
 async function getPlayerProgress(store) {
@@ -1496,6 +1524,710 @@ if (achs.length > 0) {
 }
 }
 
+/* ---------- КУРСЫ / ИЗУЧЕНИЕ МАТЕРИАЛА ---------- */
+
+/*
+Механика:
+- кусок курса изучается впервые: пользователь вписывает оценку от нейросети;
+- за первое выполнение: +20 XP и +2 ИНТ;
+- затем включаются повторения по Эббингаузу: +1 день, +3 дня, +7 дней;
+- каждое повторение даёт примерно 33% закрепления куска;
+- кусок считается полностью закреплённым после 3 повторений;
+- прогресс курса = среднее прогрессов всех кусков.
+*/
+
+const REVIEW_INTERVALS = [1, 3, 7];
+const COURSE_XP = XP_REWARDS.task; // 20 XP, как за выполненное дело
+const COURSE_STAT_BONUS = 2; // +2 к ИНТ
+
+function emptyCourse(name = 'Новый курс') {
+  return {
+    id: uid('c'),
+    name,
+    description: '',
+    createdAt: iso(new Date()),
+    pieces: []
+  };
+}
+
+function emptyPiece(name = '') {
+  return {
+    id: uid('p'),
+    name,
+    content: '',
+    grade: '',
+    firstDoneAt: null,
+    xpAwarded: false,
+    reviews: []
+  };
+}
+
+function pieceProgress(piece) {
+  if (!piece || !piece.firstDoneAt) return 0;
+
+  const totalReviews = REVIEW_INTERVALS.length || 1;
+  const doneReviews = (piece.reviews || []).filter(r => r.doneAt).length;
+
+  return Math.round((doneReviews / totalReviews) * 100);
+}
+
+function courseProgress(course) {
+  const pieces = course?.pieces || [];
+  if (!pieces.length) return 0;
+
+  const sum = pieces.reduce((acc, p) => acc + pieceProgress(p), 0);
+  return Math.round(sum / pieces.length);
+}
+
+function courseXPTotal(courses) {
+  let xp = 0;
+
+  for (const course of courses || []) {
+    for (const piece of course.pieces || []) {
+      if (piece.firstDoneAt) {
+        xp += COURSE_XP;
+      }
+    }
+  }
+
+  return xp;
+}
+
+function computeCourseStats(courses) {
+  const stats = zeroStats();
+
+  for (const course of courses || []) {
+    for (const piece of course.pieces || []) {
+      if (piece.firstDoneAt) {
+        stats.intelligence += COURSE_STAT_BONUS;
+      }
+    }
+  }
+
+  return stats;
+}
+
+function markPieceFirstDone(piece, date) {
+  if (!piece || piece.firstDoneAt) return false;
+
+  piece.firstDoneAt = date;
+  piece.xpAwarded = true;
+
+  piece.reviews = REVIEW_INTERVALS.map(offset => ({
+    offsetDays: offset,
+    dueDate: iso(addDays(parseISO(date), offset)),
+    doneAt: null
+  }));
+
+  return true;
+}
+
+function markNextReview(piece, date) {
+  if (!piece || !piece.firstDoneAt) return false;
+
+  const review = (piece.reviews || []).find(r => !r.doneAt);
+  if (!review) return false;
+
+  review.doneAt = date;
+  return true;
+}
+
+function pieceDueToday(piece, today) {
+  if (!piece.firstDoneAt) return false;
+
+  return (piece.reviews || []).some(r => !r.doneAt && r.dueDate <= today);
+}
+
+function courseDueCount(course, today) {
+  return (course?.pieces || []).filter(p => pieceDueToday(p, today)).length;
+}
+
+function findCourse(store, courseId) {
+  return (store.coursesData?.courses || []).find(c => c.id === courseId);
+}
+
+function findPiece(course, pieceId) {
+  return (course?.pieces || []).find(p => p.id === pieceId);
+}
+
+/* ---------- UI: список курсов ---------- */
+
+class CoursesModal extends Modal {
+  constructor(app, store) {
+    super(app);
+    this.store = store;
+  }
+
+  onOpen() {
+    this.render();
+  }
+
+  async render() {
+    await checkCompletedGoals(this.store);
+
+    const el = this.contentEl;
+    el.empty();
+    el.addClass('lt');
+
+    const actionsBar = el.createDiv({ cls: 'lt-actions-bar' });
+
+    actionsBar.createEl('span', {
+      text: '🎓 Курсы',
+      style: 'font-weight:700;font-size:16px;flex:1;'
+    });
+
+    actionsBar.createEl('button', {
+      text: '+ курс',
+      cls: 'mod-cta'
+    }).onclick = () => {
+      const course = emptyCourse();
+      this.store.coursesData.courses.push(course);
+      this.store.saveCourses();
+      this.close();
+      new CourseDetailModal(this.app, this.store, course.id).open();
+    };
+
+    el.createEl('h2', {
+      text: 'Изучение материала',
+      style: 'margin-top:8px;'
+    });
+
+    const courses = this.store.coursesData?.courses || [];
+    const today = iso(new Date());
+
+    if (!courses.length) {
+      el.createDiv({
+        cls: 'lt-notice',
+        text: 'Пока нет курсов. Создай первый курс.'
+      });
+      return;
+    }
+
+    for (const course of courses) {
+      const progress = courseProgress(course);
+      const dueToday = courseDueCount(course, today);
+
+      const row = el.createDiv({ cls: 'lt-row' });
+      row.style.cursor = 'pointer';
+
+      row.onclick = () => {
+        this.close();
+        new CourseDetailModal(this.app, this.store, course.id).open();
+      };
+
+      row.createEl('span', {
+        cls: 'lt-name',
+        text: course.name || '(без имени)'
+      });
+
+      row.createEl('span', {
+        cls: 'lt-chip',
+        text: `${(course.pieces || []).length} кусков`
+      });
+
+      if (dueToday > 0) {
+        row.createEl('span', {
+          cls: 'lt-chip',
+          text: `🔁 сегодня: ${dueToday}`
+        });
+      }
+
+      const bar = row.createDiv({ cls: 'lt-bar' });
+      bar.createDiv({
+        cls: 'lt-bar-fill',
+        attr: { style: `width:${progress}%` }
+      });
+
+      row.createEl('span', {
+        cls: 'lt-chip',
+        text: `${progress}%`
+      });
+
+      const del = row.createEl('button', { text: '🗑' });
+
+      del.onclick = (e) => {
+        e.stopPropagation();
+
+        if (del.dataset.arm) {
+          this.store.coursesData.courses = this.store.coursesData.courses.filter(c => c.id !== course.id);
+          this.store.saveCourses();
+          this.render();
+        } else {
+          del.dataset.arm = '1';
+          del.setText('точно?');
+          del.addClass('lt-danger');
+
+          setTimeout(() => {
+            if (del.isConnected) {
+              del.setText('🗑');
+              delete del.dataset.arm;
+              del.removeClass('lt-danger');
+            }
+          }, 2500);
+        }
+      };
+    }
+  }
+}
+
+/* ---------- UI: курс целиком ---------- */
+
+class CourseDetailModal extends Modal {
+  constructor(app, store, courseId) {
+    super(app);
+    this.store = store;
+    this.courseId = courseId;
+  }
+
+  onOpen() {
+    this.render();
+  }
+
+  render() {
+    const app = this.app;
+    const store = this.store;
+    const course = findCourse(store, this.courseId);
+
+    if (!course) {
+      this.close();
+      return;
+    }
+
+    const el = this.contentEl;
+    el.empty();
+    el.addClass('lt');
+
+    const today = iso(new Date());
+    const progress = courseProgress(course);
+    const totalPieces = (course.pieces || []).length;
+    const donePieces = (course.pieces || []).filter(p => pieceProgress(p) >= 100).length;
+    const firstDoneCount = (course.pieces || []).filter(p => p.firstDoneAt).length;
+    const dueToday = courseDueCount(course, today);
+
+    const actionsBar = el.createDiv({ cls: 'lt-actions-bar' });
+
+    actionsBar.createEl('span', {
+      text: `🎓 ${course.name || '(без имени)'}`,
+      style: 'font-weight:700;font-size:16px;flex:1;'
+    });
+
+    actionsBar.createEl('button', {
+      text: '← Курсы'
+    }).onclick = () => {
+      this.close();
+      new CoursesModal(app, store).open();
+    };
+
+    actionsBar.createEl('button', {
+      text: '✎ Курс'
+    }).onclick = () => {
+      new CourseEditModal(app, store, course.id, () => this.render()).open();
+    };
+
+    actionsBar.createEl('button', {
+      text: '+ кусок',
+      cls: 'mod-cta'
+    }).onclick = () => {
+      const piece = emptyPiece(`Кусок ${(course.pieces || []).length + 1}`);
+      course.pieces.push(piece);
+      store.saveCourses();
+      this.close();
+      new PieceModal(app, store, course.id, piece.id).open();
+    };
+
+    el.createEl('h2', {
+      text: 'Курс',
+      style: 'margin-top:8px;'
+    });
+
+    if (course.description) {
+      el.createDiv({
+        cls: 'lt-notice',
+        text: course.description
+      });
+    }
+
+    el.createDiv({
+      cls: 'lt-big'
+    }).setText(
+      `📈 Прогресс курса: ${progress}% · изучено ${firstDoneCount}/${totalPieces} · закреплено ${donePieces}/${totalPieces}`
+    );
+
+    if (dueToday > 0) {
+      el.createDiv({
+        cls: 'lt-notice',
+        text: `🔁 Сегодня нужно повторить кусков: ${dueToday}`
+      });
+    }
+
+    const bar = el.createDiv({ cls: 'lt-bar' });
+    bar.style.height = '12px';
+    bar.style.margin = '8px 0';
+    bar.createDiv({
+      cls: 'lt-bar-fill',
+      attr: { style: `width:${progress}%` }
+    });
+
+    el.createEl('h3', { text: 'Куски курса' });
+
+    if (!course.pieces.length) {
+      el.createDiv({ text: '— пусто —' });
+      return;
+    }
+
+    for (const piece of course.pieces) {
+      const piecePercent = pieceProgress(piece);
+      const due = pieceDueToday(piece, today);
+
+      const row = el.createDiv({ cls: 'lt-row' });
+
+      let icon = '🆕';
+      if (!piece.firstDoneAt) icon = '🆕';
+      else if (piecePercent >= 100) icon = '✅';
+      else if (due) icon = '🔁';
+      else icon = '📖';
+
+      row.createEl('span', {
+        cls: 'lt-chip',
+        text: icon
+      });
+
+      const nameSpan = row.createEl('span', {
+        cls: 'lt-name',
+        text: piece.name || '(без имени)'
+      });
+      nameSpan.style.cursor = 'pointer';
+      nameSpan.onclick = () => {
+        this.close();
+        new PieceModal(app, store, course.id, piece.id).open();
+      };
+
+      if (piece.grade) {
+        row.createEl('span', {
+          cls: 'lt-chip',
+          text: `оценка: ${piece.grade}`
+        });
+      }
+
+      const pieceBar = row.createDiv({ cls: 'lt-bar' });
+      pieceBar.createDiv({
+        cls: 'lt-bar-fill',
+        attr: { style: `width:${piecePercent}%` }
+      });
+
+      row.createEl('span', {
+        cls: 'lt-chip',
+        text: `${piecePercent}%`
+      });
+
+      row.createEl('button', {
+        text: '📖'
+      }).onclick = () => {
+        this.close();
+        new PieceModal(app, store, course.id, piece.id).open();
+      };
+
+      if (!piece.firstDoneAt) {
+        row.createEl('button', {
+          text: '✅',
+          cls: 'mod-cta'
+        }).onclick = () => {
+          this.close();
+          new PieceModal(app, store, course.id, piece.id).open();
+        };
+      } else if (piecePercent < 100) {
+        row.createEl('button', {
+          text: '🔁'
+        }).onclick = () => {
+          if (markNextReview(piece, today)) {
+            store.saveCourses();
+            new Notice('Повторение отмечено');
+            this.render();
+          }
+        };
+      }
+
+      const del = row.createEl('button', { text: '🗑' });
+
+      del.onclick = () => {
+        if (del.dataset.arm) {
+          course.pieces = course.pieces.filter(p => p.id !== piece.id);
+          store.saveCourses();
+          this.render();
+        } else {
+          del.dataset.arm = '1';
+          del.setText('точно?');
+          del.addClass('lt-danger');
+
+          setTimeout(() => {
+            if (del.isConnected) {
+              del.setText('🗑');
+              delete del.dataset.arm;
+              del.removeClass('lt-danger');
+            }
+          }, 2500);
+        }
+      };
+    }
+  }
+}
+
+/* ---------- UI: редактирование курса ---------- */
+
+class CourseEditModal extends Modal {
+  constructor(app, store, courseId, onSaved) {
+    super(app);
+    this.store = store;
+    this.onSaved = onSaved;
+    this.isNew = !courseId;
+
+    if (this.isNew) {
+      this.item = emptyCourse();
+    } else {
+      const course = findCourse(store, courseId);
+      this.item = course ? JSON.parse(JSON.stringify(course)) : emptyCourse();
+    }
+  }
+
+  onOpen() {
+    const el = this.contentEl;
+    el.addClass('lt');
+
+    const actionsBar = el.createDiv({ cls: 'lt-actions-bar' });
+
+    actionsBar.createEl('span', {
+      text: this.isNew ? 'Новый курс' : 'Правка курса',
+      style: 'font-weight:700;font-size:16px;flex:1;'
+    });
+
+    actionsBar.createEl('button', {
+      text: 'Сохранить ✓',
+      cls: 'mod-cta'
+    }).onclick = async () => {
+      if (!this.item.name) {
+        new Notice('Нужно название курса');
+        return;
+      }
+
+      if (this.isNew) {
+        this.store.coursesData.courses.push(this.item);
+      } else {
+        const index = this.store.coursesData.courses.findIndex(c => c.id === this.item.id);
+        if (index >= 0) {
+          this.store.coursesData.courses[index] = this.item;
+        }
+      }
+
+      await this.store.saveCourses();
+
+      if (this.onSaved) this.onSaved();
+      this.close();
+    };
+
+    el.createEl('h2', {
+      text: 'Курс',
+      style: 'margin-top:8px;'
+    });
+
+    const F = new FormBuilder(el, this.item, this.store);
+    F.text('name', 'Название');
+    F.text('description', 'Описание');
+  }
+}
+
+/* ---------- UI: кусок курса ---------- */
+
+class PieceModal extends Modal {
+  constructor(app, store, courseId, pieceId) {
+    super(app);
+    this.store = store;
+    this.courseId = courseId;
+    this.pieceId = pieceId;
+  }
+
+  onOpen() {
+    this.render();
+  }
+
+  render() {
+    const app = this.app;
+    const store = this.store;
+    const course = findCourse(store, this.courseId);
+    const piece = course ? findPiece(course, this.pieceId) : null;
+
+    if (!course || !piece) {
+      this.close();
+      return;
+    }
+
+    const el = this.contentEl;
+    el.empty();
+    el.addClass('lt');
+
+    const today = iso(new Date());
+    const progress = pieceProgress(piece);
+
+    const actionsBar = el.createDiv({ cls: 'lt-actions-bar' });
+
+    actionsBar.createEl('span', {
+      text: `📄 ${piece.name || 'Кусок курса'}`,
+      style: 'font-weight:700;font-size:16px;flex:1;'
+    });
+
+    actionsBar.createEl('button', {
+      text: '← Курс'
+    }).onclick = async () => {
+      await this.saveInputs();
+      this.close();
+      new CourseDetailModal(app, store, this.courseId).open();
+    };
+
+    actionsBar.createEl('button', {
+      text: '💾 Сохранить',
+      cls: 'mod-cta'
+    }).onclick = async () => {
+      await this.saveInputs();
+      new Notice('Сохранено ✓');
+      this.render();
+    };
+
+    el.createEl('h2', {
+      text: 'Кусок курса',
+      style: 'margin-top:8px;'
+    });
+
+    const bar = el.createDiv({ cls: 'lt-bar' });
+    bar.style.height = '10px';
+    bar.style.margin = '8px 0';
+    bar.createDiv({
+      cls: 'lt-bar-fill',
+      attr: { style: `width:${progress}%` }
+    });
+
+    const progressLabel = el.createDiv({
+      cls: 'lt-chip',
+      text: `Прогресс закрепления: ${progress}%`
+    });
+    progressLabel.style.marginBottom = '8px';
+
+    el.createEl('h3', { text: 'Название' });
+
+    this.nameInput = el.createEl('input', {
+      type: 'text',
+      cls: 'lt-wide'
+    });
+    this.nameInput.value = piece.name || '';
+
+    el.createEl('h3', { text: 'Теория и задания' });
+
+    this.contentInput = el.createEl('textarea', {
+      cls: 'lt-comment'
+    });
+    this.contentInput.value = piece.content || '';
+    this.contentInput.style.minHeight = '160px';
+
+    el.createEl('h3', { text: 'Оценка от нейросети' });
+
+    this.gradeInput = el.createEl('input', {
+      type: 'text',
+      cls: 'lt-wide',
+      placeholder: 'Например: 8/10, зачёт, хорошо и т.п.'
+    });
+    this.gradeInput.value = piece.grade || '';
+
+    el.createEl('h3', { text: 'Прогресс' });
+
+    if (!piece.firstDoneAt) {
+      const btn = el.createEl('button', {
+        text: '✅ Отметить первое выполнение (+20 XP, +2 ИНТ)',
+        cls: 'mod-cta'
+      });
+
+      btn.onclick = async () => {
+        await this.saveInputs();
+
+        if (!(piece.grade || '').toString().trim()) {
+          new Notice('Сначала впиши оценку от нейросети');
+          return;
+        }
+
+        if (markPieceFirstDone(piece, today)) {
+          await store.saveCourses();
+          await syncRewards(store);
+
+          new Notice('🎉 Кусок изучен! +20 XP, +2 ИНТ. Назначены повторения: +1, +3, +7 дней.');
+
+          this.render();
+        }
+      };
+    } else {
+      el.createDiv({
+        cls: 'lt-notice',
+        text: `Первое выполнение: ${piece.firstDoneAt}. Повторения по Эббингаузу: +1 день, +3 дня, +7 дней.`
+      });
+
+      for (const review of (piece.reviews || [])) {
+        const row = el.createDiv({ cls: 'lt-row' });
+
+        row.createEl('span', {
+          cls: 'lt-name',
+          text: `Повторение через ${review.offsetDays} дн.`
+        });
+
+        row.createEl('span', {
+          cls: 'lt-chip',
+          text: `план: ${review.dueDate}`
+        });
+
+        if (review.doneAt) {
+          row.createEl('span', {
+            cls: 'lt-chip',
+            text: `✓ выполнено ${review.doneAt}`
+          });
+        } else {
+          const overdue = review.dueDate < today;
+
+          const btn = row.createEl('button', {
+            text: overdue ? 'Отметить повторение (просрочено)' : 'Отметить повторение',
+            cls: 'mod-cta'
+          });
+
+          btn.onclick = async () => {
+            await this.saveInputs();
+
+            review.doneAt = today;
+            await store.saveCourses();
+
+            new Notice('Повторение отмечено');
+            this.render();
+          };
+        }
+      }
+
+      if (progress >= 100) {
+        el.createDiv({
+          cls: 'lt-notice',
+          text: '🏆 Кусок закреплён полностью!'
+        });
+      }
+    }
+  }
+
+  async saveInputs() {
+    const store = this.store;
+    const course = findCourse(store, this.courseId);
+    const piece = course ? findPiece(course, this.pieceId) : null;
+
+    if (!piece) return;
+
+    if (this.nameInput) piece.name = this.nameInput.value;
+    if (this.contentInput) piece.content = this.contentInput.value;
+    if (this.gradeInput) piece.grade = this.gradeInput.value;
+
+    await store.saveCourses();
+  }
+}
+
 /* ---------- Плагин ---------- */
 module.exports = class LifeTracker extends Plugin {
 async onload() {
@@ -1512,6 +2244,14 @@ this.addCommand({ id: 'lt-week', name: 'LT: открыть неделю', callba
 this.addCommand({ id: 'lt-ref', name: 'LT: справочники', callback: () => new RefModal(this.app, this.store).open() });
 this.addCommand({ id: 'lt-work', name: 'LT: дела и идеи', callback: () => new WorkItemsModal(this.app, this.store).open() });
 this.addCommand({ id: 'lt-dashboard', name: 'LT: открыть дашборд', callback: () => new DashboardModal(this.app, this.store).open() });
+
+this.addRibbonIcon('book-open', 'LifeTracker: курсы', () => new CoursesModal(this.app, this.store).open());
+
+this.addCommand({
+  id: 'lt-courses',
+  name: 'LT: открыть курсы',
+  callback: () => new CoursesModal(this.app, this.store).open()
+});
 
 /* Код-блок ```lifetracker-day [дата] */
 this.registerMarkdownCodeBlockProcessor('lifetracker-day', async (source, el, ctx) => {
