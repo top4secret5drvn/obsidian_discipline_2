@@ -331,12 +331,30 @@ function seedReference() {
 return {
 schemaVersion: 2,
 habits: [
-{ id: 'h1', name: 'Бег утром', baseEffects: { endurance: 2, health: 1, energy: -1 } },
-{ id: 'h2', name: 'Чтение',    baseEffects: { intelligence: 2 } }
+  {
+    id: 'h1',
+    name: 'Бег утром',
+    required: true,
+    baseEffects: { endurance: 2, health: 1, energy: -1 }
+  },
+  {
+    id: 'h2',
+    name: 'Чтение',
+    required: true,
+    baseEffects: { intelligence: 2 }
+  }
 ],
 activities: [{ id: 'a1', name: 'Пробежка', kcalPerUnit: 60 }],
 substances: [{ id: 's1', name: 'Омега-3' }],
-skills: [{ id: 'sk1', name: 'Бег', habitRefs: [{ habitId: 'h1', weight: 1 }] }],
+skills: [
+  {
+    id: 'sk1',
+    name: 'Бег',
+    habitRefs: [
+      { habitId: 'h1', hours: 0.5 }
+    ]
+  }
+],
 synergyRules: [{ id: 'r1', source: { type: 'habit', id: 'h1' }, target: { type: 'substance', id: 's1' }, bonus: { health: 1, endurance: 1 } }],
 goals: [{ id: 'g1', name: '100 км за июнь', targetType: 'activity', targetId: 'a1', metric: 'km', targetValue: 100, start: iso(new Date()), status: 'active' }],
 finCategories: [
@@ -378,6 +396,38 @@ if (!this.ref.finCategories) this.ref.finCategories = seedReference().finCategor
 if (!this.ref.achievements) this.ref.achievements = [];
 if (!this.ref.schemaVersion || this.ref.schemaVersion < 2) { this.ref.schemaVersion = 2; await this.saveRef(); }
 else if (!await this.a.exists(p)) await this.saveRef();
+
+/* ---------- миграция данных: обязательные привычки и часы в навыках ---------- */
+let refChanged = false;
+
+if (!Array.isArray(this.ref.habits)) this.ref.habits = [];
+
+for (const h of this.ref.habits) {
+  if (typeof h.required !== 'boolean') {
+    h.required = true;
+    refChanged = true;
+  }
+}
+
+if (!Array.isArray(this.ref.skills)) this.ref.skills = [];
+
+for (const sk of this.ref.skills) {
+  if (!Array.isArray(sk.habitRefs)) {
+    sk.habitRefs = [];
+    refChanged = true;
+  }
+
+  for (const hr of sk.habitRefs) {
+    if (typeof hr.hours !== 'number') {
+      // если раньше был weight, используем его как стартовое значение часов
+      hr.hours = typeof hr.weight === 'number' ? hr.weight : 1;
+      refChanged = true;
+    }
+  }
+}
+
+if (refChanged) await this.saveRef();
+
 const wp = this.base + '/workItems.json';
 this.work = await this.a.exists(wp) ? JSON.parse(await this.a.read(wp)) : seedWorkItems();
 if (!await this.a.exists(wp)) await this.saveWorkItems();
@@ -486,10 +536,96 @@ if (total === 0) return { done: 0, total: 0, pct: 0 };
 const done = day.habitLogs.filter(l => { const h = ref.habits.find(x => x.id === l.habitId); return h && l.done; }).length;
 return { done, total, pct: Math.round((done / total) * 100) };
 }
+
+/* ---------- обязательные / дополнительные привычки ---------- */
+
+function isOptionalHabit(h) {
+  return !!h && h.required === false;
+}
+
+function mandatoryDayCompletion(ref, day) {
+  let done = 0;
+  let total = 0;
+
+  for (const h of ref.habits || []) {
+    if (isOptionalHabit(h)) continue;
+
+    total++;
+
+    const l = (day.habitLogs || []).find(x => x.habitId === h.id);
+    if (l && l.done) done++;
+  }
+
+  const pct = total ? Math.round((done / total) * 100) : 100;
+
+  return { done, total, pct };
+}
+
+function optionalHabitsUnlocked(ref, day) {
+  const m = mandatoryDayCompletion(ref, day);
+
+  if (m.total === 0) return true;
+
+  // 75% обязательных привычек должны быть выполнены
+  return m.done * 100 >= m.total * 75;
+}
+
+function enforceHabitLock(ref, day) {
+  if (optionalHabitsUnlocked(ref, day)) return false;
+
+  let changed = false;
+
+  for (const l of day.habitLogs || []) {
+    const h = (ref.habits || []).find(x => x.id === l.habitId);
+
+    if (h && isOptionalHabit(h) && (l.done || l.hours)) {
+      l.done = false;
+      l.hours = 0;
+      changed = true;
+    }
+  }
+
+  return changed;
+}
+
 function skillHoursFor(ref, days) {
-const out = {};
-for (const sk of ref.skills) { let t = 0; for (const hr of sk.habitRefs || []) for (const d of days) { const l = d.habitLogs.find(x => x.habitId === hr.habitId); if (l && l.hours) t += l.hours * (hr.weight ?? 1); } out[sk.id] = t; }
-return out;
+  const out = {};
+
+  for (const sk of ref.skills || []) {
+    let total = 0;
+
+    for (const hr of sk.habitRefs || []) {
+      let perDone = Number(hr.hours);
+
+      if (!Number.isFinite(perDone) || perDone < 0) {
+        perDone = Number(hr.weight) || 0;
+      }
+
+      for (const d of days || []) {
+        if (!d) continue;
+
+        const l = (d.habitLogs || []).find(x => x.habitId === hr.habitId);
+        if (!l) continue;
+
+        const manual = Number(l.hours);
+
+        // если есть вручную проставленные часы — используем их
+        if (Number.isFinite(manual) && manual > 0) {
+          total += manual;
+          continue;
+        }
+
+        // иначе начисляем часы из настройки навыка, если привычка выполнена
+        if (l.done && perDone > 0) {
+          total += perDone;
+        }
+      }
+    }
+
+    out[sk.id] = Math.round(total * 100) / 100;
+  }
+
+  return out;
 }
 async function habitStreak(store, habitId, date) {
 let d = parseISO(date);
@@ -553,9 +689,32 @@ if (g.targetType === 'finance') {
 for (const d of days) {
   const day = await store.loadDay(d);
   if (g.targetType === 'skill') {
-    const sk = ref.skills.find(s => s.id === g.targetId);
-    if (sk) for (const hr of sk.habitRefs || []) { const l = day.habitLogs.find(x => x.habitId === hr.habitId); if (l && l.hours) sum += l.hours * (hr.weight ?? 1); }
-  } else {
+  const sk = ref.skills.find(s => s.id === g.targetId);
+
+  if (sk) {
+    for (const hr of sk.habitRefs || []) {
+      const l = day.habitLogs.find(x => x.habitId === hr.habitId);
+      if (!l) continue;
+
+      const manual = Number(l.hours);
+
+      if (Number.isFinite(manual) && manual > 0) {
+        sum += manual;
+        continue;
+      }
+
+      if (!l.done) continue;
+
+      let perDone = Number(hr.hours);
+
+      if (!Number.isFinite(perDone) || perDone < 0) {
+        perDone = Number(hr.weight) || 0;
+      }
+
+      sum += Math.max(0, perDone);
+    }
+  }
+} else {
     for (const l of day.activityLogs) if (!g.targetId || l.activityId === g.targetId) sum += +l.amount || 0;
   }
 }
@@ -707,10 +866,19 @@ saveBtnTop.onclick = async () => { await store.saveDay(date); new Notice('Сох
 actionsBar.createEl('button', { text: 'Готово ✓', cls: 'mod-cta' }).onclick = async () => { await store.saveDay(date); this.close(); };
 el.createEl('h2', { text: 'Трекер дня', style: 'margin-top: 8px;' });
 const footer = el.createDiv({ cls: 'lt-footer' });
+let updateHabitLock = () => false;
+const habitControls = [];
 const footerText = () => {
-  const r = computeDayStats(ref, day), k = dayKcal(ref, day), f = dayFinance(ref, day), c = dayCompletion(ref, day);
+  const r = computeDayStats(ref, day);
+  const k = dayKcal(ref, day);
+  const f = dayFinance(ref, day);
+  const c = dayCompletion(ref, day);
+  const mc = mandatoryDayCompletion(ref, day);
+
   const xpToday = computeDayXP(ref, day, store.work?.items || []);
-  return `🎯 ${c.pct}% (${c.done}/${c.total}) · ` + STATS.map(([key, lab]) => `${lab} ${r.stats[key]}`).join(' · ') +
+
+  return `🧱 обязательные ${mc.pct}% (${mc.done}/${mc.total}) · 🎯 всего ${c.pct}% (${c.done}/${c.total}) ·` +
+    STATS.map(([key, lab]) => `${lab} ${r.stats[key]}`).join(' · ') +
     ` | ккал ${k.balance >= 0 ? '+' : ''}${k.balance}` +
     ` | ₽ ${f.balance >= 0 ? '+' : ''}${f.balance}` +
     (r.syn.length ? ` | синергии: ${r.syn.length} ✅` : '') +
@@ -718,18 +886,83 @@ const footerText = () => {
 };
 // при каждом автосохранении проверяем, не выполнена ли какая-нибудь цель на 100%
 const save = debounce(() => { store.saveDay(date).then(() => checkCompletedGoals(store)); footer.setText(footerText() + ' · сохранено ✓'); }, 400);
-const refresh = () => { footer.setText(footerText()); save(); };
+const refresh = () => {
+  updateHabitLock();
+  footer.setText(footerText());
+  save();
+};
 el.createEl('h3', { text: 'Привычки' });
+
+const lockNotice = el.createDiv({ cls: 'lt-notice' });
+
 for (const h of ref.habits) {
-  const l = day.habitLogs.find(x => x.habitId === h.id);
+  let l = day.habitLogs.find(x => x.habitId === h.id);
+
+  if (!l) {
+    l = { habitId: h.id, done: false, hours: 0 };
+    day.habitLogs.push(l);
+  }
+
   const row = el.createDiv({ cls: 'lt-row' });
-  const cb = row.createEl('input', { type: 'checkbox' }); cb.checked = !!l.done;
-  cb.addEventListener('change', () => { l.done = cb.checked; refresh(); });
-  row.createEl('span', { cls: 'lt-name', text: h.name });
-  row.createEl('span', { cls: 'lt-chip', text: fmtStats(h.baseEffects) });
+
+  const cb = row.createEl('input', { type: 'checkbox' });
+  cb.checked = !!l.done;
+
+  cb.addEventListener('change', () => {
+    if (cb.disabled) return;
+
+    l.done = cb.checked;
+    refresh();
+  });
+
+  row.createEl('span', {
+    cls: 'lt-name',
+    text: h.name + (isOptionalHabit(h) ? ' (доп)' : '')
+  });
+
+  row.createEl('span', {
+    cls: 'lt-chip',
+    text: fmtStats(h.baseEffects)
+  });
+
   const sk = row.createEl('span', { cls: 'lt-chip' });
+
   habitStreak(store, h.id, date).then(n => sk.setText(n ? `🔥${n}` : ''));
+
+  habitControls.push({ habit: h, log: l, cb, row });
 }
+
+updateHabitLock = () => {
+  const mc = mandatoryDayCompletion(ref, day);
+  const allowed = optionalHabitsUnlocked(ref, day);
+  const hasOptional = (ref.habits || []).some(h => isOptionalHabit(h));
+
+  lockNotice.setText(
+    `🔒 Дополнительные привычки недоступны: обязательные ${mc.pct}% (${mc.done}/${mc.total}). Нужно 75%.`
+  );
+
+  lockNotice.style.display = (!allowed && hasOptional) ? '' : 'none';
+
+  let changed = false;
+
+  for (const ctrl of habitControls) {
+    const locked = isOptionalHabit(ctrl.habit) && !allowed;
+
+    if (locked && (ctrl.log.done || ctrl.log.hours)) {
+      ctrl.log.done = false;
+      ctrl.log.hours = 0;
+      changed = true;
+    }
+
+    ctrl.cb.disabled = locked;
+    ctrl.cb.checked = !!ctrl.log.done;
+
+    if (locked) ctrl.row.addClass('lt-locked');
+    else ctrl.row.removeClass('lt-locked');
+  }
+
+  return changed;
+};
 el.createEl('h3', { text: 'Вещества' });
 for (const s of ref.substances) {
   const l = day.substanceLogs.find(x => x.substanceId === s.id);
@@ -804,6 +1037,7 @@ for (const [key, lab] of STATES) {
 el.createEl('h3', { text: 'Комментарий' });
 const ta = el.createEl('textarea', { cls: 'lt-comment' }); ta.value = day.comment || '';
 ta.addEventListener('input', () => { day.comment = ta.value; save(); });
+if (updateHabitLock()) save();
 footer.setText(footerText());
 }
 }
@@ -877,7 +1111,7 @@ const uid = p => p + '_' + Date.now().toString(36) + Math.random().toString(36).
 const TITLES = { habits: 'Привычка', activities: 'Активность', substances: 'Вещество', skills: 'Навык', synergyRules: 'Синергия', goals: 'Цель', finCategories: 'Категория финансов' };
 function newItem(key) {
 switch (key) {
-case 'habits': return { id: uid('h'), name: '', baseEffects: zeroStats() };
+case 'habits': return { id: uid('h'), name: '', required: true, baseEffects: zeroStats() };
 case 'activities': return { id: uid('a'), name: '', kcalPerUnit: 0 };
 case 'substances': return { id: uid('s'), name: '' };
 case 'skills': return { id: uid('sk'), name: '', description: '', habitRefs: [] };
@@ -894,7 +1128,7 @@ return it ? it.name : '?(удалено)';
 }
 function subline(ref, key, it) {
 switch (key) {
-case 'habits': return fmtStats(it.baseEffects);
+case 'habits': return `${it.required === false ? 'дополнительная' : 'обязательная'} · ${fmtStats(it.baseEffects)}`;
 case 'activities': return it.kcalPerUnit + ' ккал/ед';
 case 'skills': return (it.habitRefs || []).length + ' связей';
 case 'synergyRules': return fmtStats(it.bonus);
@@ -941,14 +1175,14 @@ for (const [key, label, fmt] of cols) {
   el.createEl('button', { text: '+ добавить', cls: 'lt-add' }).onclick = () => new EditModal(this.app, this.store, key, null, () => this.render()).open();
 }
 el.createEl('h3', { text: '📈 Уровни навыков (текущие часы)' });
-const hoursMap = {};
-for (const d of (await this.store.listDays())) {
-  const day = await this.store.loadDay(d);
-  for (const sk of ref.skills) for (const hr of sk.habitRefs || []) {
-    const l = day.habitLogs.find(x => x.habitId === hr.habitId);
-    if (l && l.hours) hoursMap[sk.id] = (hoursMap[sk.id] || 0) + l.hours * (hr.weight ?? 1);
-  }
+
+const allDayObjects = [];
+
+for (const d of await this.store.listDays()) {
+  allDayObjects.push(await this.store.loadDay(d));
 }
+
+const hoursMap = skillHoursFor(ref, allDayObjects);
 for (const sk of ref.skills) {
   const h = hoursMap[sk.id] || 0;
   const lv = skillLevel(h);
@@ -987,6 +1221,7 @@ for (const [v, t] of opts) { const o = s.createEl('option', { value: v, text: t 
 s.addEventListener('change', () => { this.item[k] = s.value; onChange && onChange(); });
 }
 stats(k, label) {
+if (!this.item[k]) this.item[k] = zeroStats();
 this.el.createDiv({ cls: 'lt-flabel', text: label });
 const r = this.el.createDiv({ cls: 'lt-stats' });
 for (const [key, lab] of STATS) {
@@ -1012,22 +1247,83 @@ is.addEventListener('change', () => { this.item[k].id = is.value; });
 fill();
 }
 refs(k) {
-const wrap = this.el.createDiv();
-const render = () => {
-wrap.empty();
-this.item[k].forEach((hr, idx) => {
-const r = wrap.createDiv({ cls: 'lt-row' });
-const s = r.createEl('select');
-for (const h of this.store.ref.habits) { const o = s.createEl('option', { value: h.id, text: h.name }); if (hr.habitId === h.id) o.selected = true; }
-s.addEventListener('change', () => { hr.habitId = s.value; });
-const w = r.createEl('input', { type: 'number', cls: 'lt-input', attr: { step: '0.1', min: '0', max: '1' } });
-w.value = String(hr.weight ?? 1);
-w.addEventListener('input', () => { hr.weight = +w.value || 0; });
-r.createEl('button', { text: '✕' }).onclick = () => { this.item[k].splice(idx, 1); render(); };
-});
-wrap.createEl('button', { text: '+ связь с привычкой', cls: 'lt-add' }).onclick = () => { this.item[k].push({ habitId: this.store.ref.habits[0]?.id || '', weight: 1 }); render(); };
-};
-render();
+  if (!Array.isArray(this.item[k])) this.item[k] = [];
+
+  const wrap = this.el.createDiv();
+
+  const render = () => {
+    wrap.empty();
+
+    this.item[k].forEach((hr, idx) => {
+      const r = wrap.createDiv({ cls: 'lt-row' });
+
+      const habits = this.store.ref.habits || [];
+
+      const s = r.createEl('select');
+
+      for (const h of habits) {
+        const o = s.createEl('option', { value: h.id, text: h.name });
+        if (hr.habitId === h.id) o.selected = true;
+      }
+
+      if (!habits.some(h => h.id === hr.habitId)) {
+        const first = habits[0];
+        s.value = first ? first.id : '';
+        hr.habitId = s.value;
+      }
+
+      s.addEventListener('change', () => {
+        hr.habitId = s.value;
+      });
+
+      r.createEl('span', {
+        cls: 'lt-flabel',
+        text: 'часов за выполнение'
+      });
+
+      const hours = r.createEl('input', {
+        type: 'number',
+        cls: 'lt-input',
+        attr: {
+          step: '0.25',
+          min: '0'
+        }
+      });
+
+      hours.value = String(hr.hours ?? 0.5);
+
+      hours.addEventListener('input', () => {
+        const val = parseFloat(String(hours.value).replace(',', '.'));
+        hr.hours = Number.isFinite(val) && val >= 0 ? val : 0;
+      });
+
+      r.createEl('button', { text: '✕' }).onclick = () => {
+        this.item[k].splice(idx, 1);
+        render();
+      };
+    });
+
+    wrap.createEl('button', {
+      text: '+ связь с привычкой',
+      cls: 'lt-add'
+    }).onclick = () => {
+      const habits = this.store.ref.habits || [];
+
+      if (!habits.length) {
+        new Notice('Сначала добавь хотя бы одну привычку');
+        return;
+      }
+
+      this.item[k].push({
+        habitId: habits[0].id,
+        hours: 0.5
+      });
+
+      render();
+    };
+  };
+
+  render();
 }
 refSelect(k, label, collGetter, onRegister) {
 const r = this.row(label); const s = r.createEl('select');
@@ -1047,6 +1343,22 @@ constructor(app, store, collKey, item, onSaved) {
 super(app); this.store = store; this.collKey = collKey; this.onSaved = onSaved;
 this.isNew = !item;
 this.item = item ? JSON.parse(JSON.stringify(item)) : newItem(collKey);
+
+if (this.collKey === 'skills') {
+  if (!Array.isArray(this.item.habitRefs)) {
+    this.item.habitRefs = [];
+  }
+
+  this.item.habitRefs.forEach(hr => {
+    if (typeof hr.hours !== 'number') {
+      hr.hours = typeof hr.weight === 'number' ? hr.weight : 0.5;
+    }
+  });
+}
+
+if (this.collKey === 'habits' && typeof this.item.required !== 'boolean') {
+  this.item.required = true;
+}
 }
 onOpen() {
 const el = this.contentEl; el.addClass('lt');
@@ -1065,7 +1377,10 @@ actionsBar.createEl('button', { text: 'Сохранить ✓', cls: 'mod-cta' }
       new Notice('Достижение создано: ' + it.name);
     }
   }
-  const arr = this.store.ref[this.collKey];
+  if (this.collKey === 'skills' && Array.isArray(it.habitRefs)) {
+  it.habitRefs = it.habitRefs.filter(hr => hr && hr.habitId);
+}
+const arr = this.store.ref[this.collKey];
   if (this.isNew) arr.push(it);
   else { const i = arr.findIndex(x => x.id === it.id); if (i >= 0) arr[i] = it; }
   await this.store.saveRef();
@@ -1075,7 +1390,26 @@ actionsBar.createEl('button', { text: 'Сохранить ✓', cls: 'mod-cta' }
 el.createEl('h2', { text: 'Редактирование', style: 'margin-top: 8px;' });
 const F = new FormBuilder(el, it, this.store);
 switch (this.collKey) {
-  case 'habits': F.text('name', 'Название'); F.stats('baseEffects', 'Эффекты за выполнение'); break;
+  case 'habits': {
+    F.text('name', 'Название');
+
+    const reqRow = F.row('Тип привычки');
+
+    const reqCb = reqRow.createEl('input', { type: 'checkbox' });
+    reqCb.checked = it.required !== false;
+
+    reqCb.addEventListener('change', () => {
+      it.required = reqCb.checked;
+    });
+
+    reqRow.createEl('span', {
+      cls: 'lt-chip',
+      text: 'если выключено — дополнительная'
+    });
+
+    F.stats('baseEffects', 'Эффекты за выполнение');
+    break;
+  }
   case 'activities': F.text('name', 'Название'); F.num('kcalPerUnit', 'ккал за единицу'); break;
   case 'substances': F.text('name', 'Название'); break;
   case 'skills': F.text('name', 'Название'); F.text('description', 'Описание'); F.refs('habitRefs'); break;
@@ -1477,17 +1811,14 @@ statsCard.createEl('div', { cls: 'lt-dash-value', text: fmtStats(r.stats) });
 el.createEl('button', { text: 'Открыть полный трекер дня', cls: 'mod-cta' }).onclick = () => { this.close(); new DayModal(this.app, this.store, today).open(); };
 // 2. Навыки (суммарно за всё время)
 el.createEl('h3', { text: '📈 Навыки' });
-const allDays = await this.store.listDays();
-const hoursMap = {};
-for (const d of allDays) {
-  const dData = await this.store.loadDay(d);
-  for (const sk of ref.skills) {
-    for (const hr of sk.habitRefs || []) {
-      const l = dData.habitLogs.find(x => x.habitId === hr.habitId);
-      if (l && l.hours) hoursMap[sk.id] = (hoursMap[sk.id] || 0) + l.hours * (hr.weight ?? 1);
-    }
-  }
+
+const allDayObjects = [];
+
+for (const d of await this.store.listDays()) {
+  allDayObjects.push(await this.store.loadDay(d));
 }
+
+const hoursMap = skillHoursFor(ref, allDayObjects);
 for (const sk of ref.skills.slice(0, 5)) {
   const h = hoursMap[sk.id] || 0;
   const lv = skillLevel(h);
@@ -2275,8 +2606,16 @@ const saveNow = async () => { await store.saveDay(targetDate); checkCompletedGoa
 
 const render = async () => {
 el.empty();
+
 const day = await store.loadDay(targetDate);
+
+if (enforceHabitLock(ref, day)) {
+  await store.saveDay(targetDate);
+}
+
+const optionalAllowed = optionalHabitsUnlocked(ref, day);
 const c = dayCompletion(ref, day);
+const mc = mandatoryDayCompletion(ref, day);
 const r = computeDayStats(ref, day);
 const k = dayKcal(ref, day);
 const f = dayFinance(ref, day);
@@ -2301,14 +2640,26 @@ dateInp.addEventListener('change', () => { if (dateInp.value) { targetDate = dat
 navBtn('▶', () => { targetDate = iso(addDays(parseISO(targetDate), 1)); rerender(); });
 navBtn('⌂ сегодня', () => { targetDate = iso(new Date()); rerender(); });
 
-line(`┌─ ДЕНЬ · ${targetDate} · ${WD[(parseISO(targetDate).getDay() + 6) % 7]} · 🎯 ${c.pct}% (${c.done}/${c.total}) ─────`, 'lt-a-head');
+line(`┌─ ДЕНЬ · ${targetDate} · ${WD[(parseISO(targetDate).getDay() + 6) % 7]} · 🧱 ${mc.pct}% (${mc.done}/${mc.total}) · 🎯 ${c.pct}% (${c.done}/${c.total}) ─────`, 'lt-a-head');
 line('│ ПРИВЫЧКИ', 'lt-a-sec');
-const wH = Math.max(10, ...ref.habits.map(h => h.name.length)) + 1;
+const wH = Math.max(
+  10,
+  ...ref.habits.map(h => (h.name + (isOptionalHabit(h) ? ' (доп)' : '')).length)
+) + 1;
 for (const h of ref.habits) {
-  const l = day.habitLogs.find(x => x.habitId === h.id);
+  const l = day.habitLogs.find(x => x.habitId === h.id) || { done: false, hours: 0 };
+
   const streak = await habitStreak(store, h.id, targetDate);
   const eff = fmtStats(h.baseEffects);
-  line(`│  [${l.done ? '✓' : ' '}] ${pad(h.name, wH)}${eff === '—' ? '' : eff + '  '}${fmtH(l.hours || 0)}${streak ? '  🔥' + streak : ''}`);
+
+  const locked = isOptionalHabit(h) && !optionalAllowed;
+  const mark = locked ? '🔒' : (l.done ? '✓' : ' ');
+
+  const displayName = h.name + (isOptionalHabit(h) ? ' (доп)' : '');
+
+  line(
+    `│ [${mark}] ${pad(displayName, wH)}${eff === '—' ? '' : eff + ' '}${fmtH(l.hours || 0)}${streak ? ' 🔥' + streak : ''}`
+  );
 }
 if (ref.substances.length) {
   line('│ ВЕЩЕСТВА', 'lt-a-sec');
@@ -2349,13 +2700,42 @@ const bigBtn = (parent, txt, fn) => { const b = parent.createEl('button', { cls:
 const head = t => touch.createEl('h4', { text: t });
 
 head('Привычки');
+
 for (const h of ref.habits) {
-  const l = day.habitLogs.find(x => x.habitId === h.id);
+  let l = day.habitLogs.find(x => x.habitId === h.id);
+
+  if (!l) {
+    l = { habitId: h.id, done: false, hours: 0 };
+    day.habitLogs.push(l);
+  }
+
+  const locked = isOptionalHabit(h) && !optionalAllowed;
+
+  if (locked && l.done) {
+    l.done = false;
+  }
+
   const row = touch.createDiv({ cls: 'lt-touch-row' });
-  const cb = row.createEl('input', { type: 'checkbox', cls: 'lt-big-check' });
+
+  if (locked) row.addClass('lt-locked');
+
+  const cb = row.createEl('input', {
+    type: 'checkbox',
+    cls: 'lt-big-check'
+  });
+
   cb.checked = !!l.done;
-  cb.onchange = act(() => { l.done = cb.checked; });
-  row.createEl('span', { cls: 'lt-touch-name', text: h.name });
+  cb.disabled = locked;
+
+  cb.onchange = act(() => {
+    if (cb.disabled) return;
+    l.done = cb.checked;
+  });
+
+  row.createEl('span', {
+    cls: 'lt-touch-name',
+    text: h.name + (isOptionalHabit(h) ? ' (доп)' : '')
+  });
 }
 if (ref.substances.length) {
   head('Вещества');
