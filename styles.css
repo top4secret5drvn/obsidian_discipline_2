@@ -208,3 +208,20 @@ pre.block-language-lifetracker-day,
 .lt-row button {
   flex-shrink: 0;
 }
+
+/* ---------- блокировка дополнительных привычек ---------- */
+
+.lt-locked {
+  opacity: 0.55;
+}
+
+.lt-row input:disabled,
+.lt-touch-row input:disabled,
+.lt-big-check:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.lt-ascii-line {
+  user-select: none;
+}
