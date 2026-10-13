@@ -457,6 +457,112 @@ this.rewardsData = { ...DEFAULT_REWARDS_DATA };
 async listDays() { try { const { files } = await this.a.list(this.base + '/journal'); return files.map(f => f.split('/').pop().replace('.json', '')).sort(); } catch (e) { return []; } }
 }
 
+/* ---------- Экспорт всей сохранённой истории ---------- */
+async function exportAllTime(store) {
+// Читаем журнал напрямую: loadDay добавляет современные справочники к старым дням.
+// Ошибки чтения не скрываем, чтобы неполная выгрузка не выглядела успешной.
+const { files } = await store.a.list(store.base + '/journal');
+const paths = files.filter(p => /\/\d{4}-\d{2}-\d{2}\.json$/.test(p)).sort();
+const days = [];
+for (const path of paths) {
+  const date = path.split('/').pop().slice(0, -5);
+  const day = JSON.parse(await store.a.read(path));
+  days.push({ ...day, date });
+}
+const ref = store.ref;
+const meta = {
+  schemaVersion: 1,
+  exportedAt: new Date().toISOString(),
+  period: { from: days[0]?.date || null, to: days[days.length - 1]?.date || null },
+  dayCount: days.length,
+  historyNote: 'Дневные записи содержат сохранённую историю. Справочники, цели, дела, навыки и награды — текущее состояние с имеющимися датами; история их изменений не велась.'
+};
+const named = (logs, collection, key) => (logs || []).map(log => {
+  const definition = (collection || []).find(item => item.id === log[key]);
+  return { ...log, name: definition?.name ?? null };
+});
+// Процент считаем по записям каждого дня, включая удалённые привычки.
+// Пропущенный календарный день прерывает серию; ограничения в 365 дней нет.
+const streaks = new Map();
+const summaries = new Map();
+let previousDate = null;
+const habitDays = days.map(day => {
+  if (previousDate && iso(addDays(parseISO(previousDate), 1)) !== day.date) streaks.clear();
+  const logs = named(day.habitLogs, ref.habits, 'habitId');
+  const present = new Set(logs.map(log => log.habitId));
+  for (const id of streaks.keys()) if (!present.has(id)) streaks.delete(id);
+  const habits = logs.map(log => {
+    const streak = log.done ? (streaks.get(log.habitId) || 0) + 1 : 0;
+    streaks.set(log.habitId, streak);
+    const summary = summaries.get(log.habitId) || { habitId: log.habitId, name: log.name, recordedDays: 0, completedDays: 0, longestStreak: 0 };
+    summary.recordedDays++;
+    if (log.done) summary.completedDays++;
+    summary.longestStreak = Math.max(summary.longestStreak, streak);
+    summaries.set(log.habitId, summary);
+    return { ...log, streak };
+  });
+  previousDate = day.date;
+  const done = logs.filter(log => log.done).length;
+  return { date: day.date, habits, completion: { done, total: logs.length, pct: logs.length ? Math.round(done / logs.length * 10000) / 100 : 0 } };
+});
+const habitSummary = [...summaries.values()].map(summary => ({
+  ...summary, completionPercent: Math.round(summary.completedDays / summary.recordedDays * 10000) / 100,
+  streakAtLastRecordedDate: streaks.get(summary.habitId) || 0
+}));
+const exports = {
+  'finances.json': {
+    ...meta, categories: ref.finCategories || [],
+    days: days.map(day => ({ date: day.date, entries: (day.financeLogs || []).map(log => {
+      const category = (ref.finCategories || []).find(c => c.id === log.categoryId);
+      return { ...log, categoryName: category?.name ?? null, type: category?.type ?? null };
+    }) }))
+  },
+  'activities-food-substances.json': {
+    ...meta, activities: ref.activities || [], substances: ref.substances || [],
+    days: days.map(day => ({ date: day.date,
+      activities: named(day.activityLogs, ref.activities, 'activityId'),
+      meals: day.meals || [], substances: named(day.substanceLogs, ref.substances, 'substanceId'),
+      calories: dayKcal(ref, { meals: day.meals || [], activityLogs: day.activityLogs || [] })
+    }))
+  },
+  'goals-ideas-tasks-skills-rewards.json': {
+    ...meta, goals: ref.goals || [],
+    ideas: (store.work?.items || []).filter(item => item.kind === 'idea'),
+    tasks: (store.work?.items || []).filter(item => item.kind === 'task'),
+    skills: ref.skills || [], achievements: ref.achievements || [], rewards: store.rewardsData,
+    days: days.map(day => ({ date: day.date, completedWorkItems: day.completedWorkItems || [],
+      skillHours: skillHoursFor(ref, [{ ...day, habitLogs: day.habitLogs || [] }])
+    })),
+    skillHoursTotal: skillHoursFor(ref, days.map(day => ({ ...day, habitLogs: day.habitLogs || [] })))
+  },
+  'habits.json': {
+    ...meta, habits: ref.habits || [], synergyRules: ref.synergyRules || [],
+    calculationNote: 'Проценты рассчитаны по сохранённым записям привычек. Пропущенный день или отсутствие привычки прерывает стрик. Калории и часы навыков рассчитаны по текущим справочникам.',
+    summary: habitSummary, days: habitDays
+  }
+};
+// Сериализуем всё до записи; каждый экспорт получает отдельную папку.
+const contents = Object.entries(exports).map(([name, data]) => [name, JSON.stringify(data, null, 2)]);
+const root = store.base + '/exports';
+if (!await store.a.exists(root)) await store.a.mkdir(root);
+const base = root + '/' + meta.exportedAt.replace(/[:.]/g, '-');
+let folder = base, suffix = 1;
+while (await store.a.exists(folder)) folder = base + '-' + suffix++;
+await store.a.mkdir(folder);
+for (const [name, content] of contents) await store.a.write(folder + '/' + name, content);
+return folder;
+}
+
+async function notifyExport(store) {
+try {
+  const folder = await exportAllTime(store);
+  new Notice('Экспорт готов: 4 JSON в папке хранилища ' + folder, 15000);
+} catch (error) {
+  console.error('LifeTracker: ошибка экспорта', error);
+  new Notice('Не удалось завершить экспорт: ' + error.message, 15000);
+}
+}
+
 /* ---------- Compute ---------- */
 function epDone(day, ep) {
 if (ep.type === 'habit')     { const l = day.habitLogs.find(x => x.habitId === ep.id); return !!(l && l.done); }
@@ -1420,6 +1526,11 @@ const ref = this.store.ref;
 const day = await this.store.loadDay(today);
 const actionsBar = el.createDiv({ cls: 'lt-actions-bar' });
 actionsBar.createEl('span', { text: '📊 Дашборд персонажа', style: 'font-weight: 700; font-size: 16px; flex: 1;' });
+const exportButton = actionsBar.createEl('button', { text: '📤 Экспорт всех данных' });
+exportButton.onclick = async () => {
+  exportButton.disabled = true;
+  try { await notifyExport(this.store); } finally { exportButton.disabled = false; }
+};
 el.createEl('h2', { text: 'Обзор прогресса', style: 'margin-top: 8px;' });
 // свежие данные: дозрели ли цели, корректны ли валюта/слоты
 await checkCompletedGoals(this.store);
@@ -2244,6 +2355,7 @@ this.addCommand({ id: 'lt-week', name: 'LT: открыть неделю', callba
 this.addCommand({ id: 'lt-ref', name: 'LT: справочники', callback: () => new RefModal(this.app, this.store).open() });
 this.addCommand({ id: 'lt-work', name: 'LT: дела и идеи', callback: () => new WorkItemsModal(this.app, this.store).open() });
 this.addCommand({ id: 'lt-dashboard', name: 'LT: открыть дашборд', callback: () => new DashboardModal(this.app, this.store).open() });
+this.addCommand({ id: 'lt-export-all', name: 'LT: экспорт всех данных в JSON', callback: () => notifyExport(this.store) });
 
 this.addRibbonIcon('book-open', 'LifeTracker: курсы', () => new CoursesModal(this.app, this.store).open());
 
