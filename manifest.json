@@ -1,9 +1,9 @@
 {
   "id": "lifetracker",
   "name": "LifeTracker",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "minAppVersion": "1.4.0",
-  "description": "Локальный RPG-трекер привычек/навыков. JSON, офлайн, без хостинга.",
+  "description": "Локальный RPG-трекер привычек/навыков. Курсы, повторения по Эббингаузу, JSON, офлайн, без хостинга.",
   "author": "you",
   "isDesktopOnly": false
 }
