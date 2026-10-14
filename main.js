@@ -799,6 +799,32 @@ const statValue = currentStats[req.stat] || 0;
 return statValue >= req.threshold;
 }
 
+/* ---------- Обязательные привычки ---------- */
+const isRequiredHabit = habit => habit.required !== false;
+function requiredHabitProgress(ref, day) {
+  const required = ref.habits.filter(isRequiredHabit);
+  const done = required.filter(h => (day.habitLogs || []).some(log => log.habitId === h.id && log.done)).length;
+  const needed = Math.ceil(required.length * 0.75);
+  return { done, total: required.length, needed, unlocked: done >= needed };
+}
+function setHabitDone(ref, day, habit, done) {
+  const log = day.habitLogs.find(log => log.habitId === habit.id);
+  if (!log) return false;
+  if (done && !log.done && !isRequiredHabit(habit) && !requiredHabitProgress(ref, day).unlocked) return false;
+  log.done = done;
+  return true;
+}
+function habitGateText(ref, day) {
+  const p = requiredHabitProgress(ref, day);
+  return `Обязательные: ${p.done}/${p.total}. Для необязательных нужно ${p.needed} (75%).`;
+}
+function updateHabitControl(cb, ref, day, habit) {
+  const log = day.habitLogs.find(log => log.habitId === habit.id);
+  cb.checked = !!log?.done;
+  cb.disabled = !isRequiredHabit(habit) && !log?.done && !requiredHabitProgress(ref, day).unlocked;
+  cb.title = cb.disabled ? habitGateText(ref, day) : '';
+}
+
 /* ---------- UI: ДЕНЬ ---------- */
 class DayModal extends Modal {
 constructor(app, store, date) { super(app); this.store = store; this.date = date; }
@@ -826,16 +852,24 @@ const footerText = () => {
 const save = debounce(() => { store.saveDay(date).then(() => checkCompletedGoals(store)); footer.setText(footerText() + ' · сохранено ✓'); }, 400);
 const refresh = () => { footer.setText(footerText()); save(); };
 el.createEl('h3', { text: 'Привычки' });
+const gate = el.createDiv({ cls: 'lt-chip' });
+const habitControls = [];
+const refreshHabitControls = () => { gate.setText(habitGateText(ref, day)); for (const [control, habit] of habitControls) updateHabitControl(control, ref, day, habit); };
 for (const h of ref.habits) {
   const l = day.habitLogs.find(x => x.habitId === h.id);
   const row = el.createDiv({ cls: 'lt-row' });
   const cb = row.createEl('input', { type: 'checkbox' }); cb.checked = !!l.done;
-  cb.addEventListener('change', () => { l.done = cb.checked; refresh(); });
+  habitControls.push([cb, h]);
+  cb.addEventListener('change', () => {
+    if (!setHabitDone(ref, day, h, cb.checked)) new Notice(habitGateText(ref, day));
+    refreshHabitControls(); refresh();
+  });
   row.createEl('span', { cls: 'lt-name', text: h.name });
   row.createEl('span', { cls: 'lt-chip', text: fmtStats(h.baseEffects) });
   const sk = row.createEl('span', { cls: 'lt-chip' });
   habitStreak(store, h.id, date).then(n => sk.setText(n ? `🔥${n}` : ''));
 }
+refreshHabitControls();
 el.createEl('h3', { text: 'Вещества' });
 for (const s of ref.substances) {
   const l = day.substanceLogs.find(x => x.substanceId === s.id);
@@ -983,7 +1017,7 @@ const uid = p => p + '_' + Date.now().toString(36) + Math.random().toString(36).
 const TITLES = { habits: 'Привычка', activities: 'Активность', substances: 'Вещество', skills: 'Навык', synergyRules: 'Синергия', goals: 'Цель', finCategories: 'Категория финансов' };
 function newItem(key) {
 switch (key) {
-case 'habits': return { id: uid('h'), name: '', baseEffects: zeroStats() };
+case 'habits': return { id: uid('h'), name: '', required: true, baseEffects: zeroStats() };
 case 'activities': return { id: uid('a'), name: '', kcalPerUnit: 0 };
 case 'substances': return { id: uid('s'), name: '' };
 case 'skills': return { id: uid('sk'), name: '', description: '', habitRefs: [] };
@@ -1000,7 +1034,7 @@ return it ? it.name : '?(удалено)';
 }
 function subline(ref, key, it) {
 switch (key) {
-case 'habits': return fmtStats(it.baseEffects);
+case 'habits': return (isRequiredHabit(it) ? 'Обязательная' : 'Необязательная') + ' · ' + fmtStats(it.baseEffects);
 case 'activities': return it.kcalPerUnit + ' ккал/ед';
 case 'skills': return (it.habitRefs || []).length + ' связей';
 case 'synergyRules': return fmtStats(it.bonus);
@@ -1083,6 +1117,7 @@ el.createEl('button', { text: '+ добавить достижение', cls: 'l
 /* ---------- конструктор форм ---------- */
 class FormBuilder {
 constructor(el, item, store) { this.el = el; this.item = item; this.store = store; }
+checkbox(k, label, defaultValue = false) { const r = this.row(); const wrapper = r.createEl('label'); const i = wrapper.createEl('input', { type: 'checkbox' }); i.checked = this.item[k] ?? defaultValue; wrapper.createEl('span', { text: label }); i.addEventListener('change', () => { this.item[k] = i.checked; }); }
 row(label) { const r = this.el.createDiv({ cls: 'lt-row' }); if (label) r.createEl('span', { cls: 'lt-flabel', text: label }); return r; }
 text(k, label) { const r = this.row(label); const i = r.createEl('input', { type: 'text', cls: 'lt-wide' }); i.value = this.item[k] || ''; i.addEventListener('input', () => { this.item[k] = i.value; }); }
 num(k, label) { const r = this.row(label); const i = r.createEl('input', { type: 'number', cls: 'lt-input' }); i.value = String(this.item[k] ?? 0); i.addEventListener('input', () => { this.item[k] = +i.value || 0; }); }
@@ -1181,7 +1216,7 @@ actionsBar.createEl('button', { text: 'Сохранить ✓', cls: 'mod-cta' }
 el.createEl('h2', { text: 'Редактирование', style: 'margin-top: 8px;' });
 const F = new FormBuilder(el, it, this.store);
 switch (this.collKey) {
-  case 'habits': F.text('name', 'Название'); F.stats('baseEffects', 'Эффекты за выполнение'); break;
+  case 'habits': F.text('name', 'Название'); F.checkbox('required', 'Обязательная', true); F.stats('baseEffects', 'Эффекты за выполнение'); break;
   case 'activities': F.text('name', 'Название'); F.num('kcalPerUnit', 'ккал за единицу'); break;
   case 'substances': F.text('name', 'Название'); break;
   case 'skills': F.text('name', 'Название'); F.text('description', 'Описание'); F.refs('habitRefs'); break;
@@ -2461,12 +2496,14 @@ const bigBtn = (parent, txt, fn) => { const b = parent.createEl('button', { cls:
 const head = t => touch.createEl('h4', { text: t });
 
 head('Привычки');
+touch.createDiv({ cls: 'lt-chip', text: habitGateText(ref, day) });
 for (const h of ref.habits) {
   const l = day.habitLogs.find(x => x.habitId === h.id);
   const row = touch.createDiv({ cls: 'lt-touch-row' });
   const cb = row.createEl('input', { type: 'checkbox', cls: 'lt-big-check' });
   cb.checked = !!l.done;
-  cb.onchange = act(() => { l.done = cb.checked; });
+  updateHabitControl(cb, ref, day, h);
+  cb.onchange = act(() => { if (!setHabitDone(ref, day, h, cb.checked)) new Notice(habitGateText(ref, day)); });
   row.createEl('span', { cls: 'lt-touch-name', text: h.name });
 }
 if (ref.substances.length) {
