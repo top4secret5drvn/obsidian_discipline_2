@@ -1,4 +1,4 @@
-/* LifeTracker v0.4.0 · plain JS · офлайн */
+/* LifeTracker v0.4.1 · plain JS · офлайн */
 const { Plugin, Modal, Notice, debounce } = require('obsidian');
 
 /* ROADMAPS_BUNDLE_START */
@@ -25,6 +25,21 @@ class MetricRegistry {
   }
   get(key) { return this.metrics.get(key); }
   list() { return [...this.metrics.values()]; }
+}
+function skillHoursForDay(skill, day) {
+  const seen = new Set();
+  return (skill.habitRefs || []).reduce((sum, link) => {
+    if (seen.has(link.habitId)) return sum;
+    seen.add(link.habitId);
+    const log = (day.habitLogs || []).find(l => l.habitId === link.habitId);
+    if (!log) return sum;
+    if (link.hoursPerCompletion !== undefined) {
+      return sum + (log.done && Number.isFinite(link.hoursPerCompletion) && link.hoursPerCompletion >= 0 ? link.hoursPerCompletion : 0);
+    }
+    // Legacy links keep manual logged hours and their previous weight.
+    const hours = Number(log.hours) || 0, weight = link.weight ?? 1;
+    return sum + (Number.isFinite(weight) ? Math.max(0, hours) * Math.max(0, weight) : 0);
+  }, 0);
 }
 function createRegistry(h = {}) {
   const r = new MetricRegistry();
@@ -59,7 +74,7 @@ function createRegistry(h = {}) {
     eventMetric('finance.' + type, label, 'Финансы', '₽', 'finCategories', (ctx, c) => finance(type, ctx, c), { methods: ['sum', 'average'], entities: ctx => ctx.ref.finCategories.filter(x => type === 'balance' || x.type === type), signed: type === 'balance' });
   }
   if (h.dayCompletion) eventMetric('habit.completion', 'Дневной процент выполнения привычек', 'Привычки', '%', null, ctx => ctx.days.map(d => ({ id: d.date, date: d.date, value: h.dayCompletion(ctx.ref, d).pct })), { methods: ['average'] });
-  const skillHours = (ctx, c) => ctx.days.flatMap(day => ctx.ref.skills.filter(sk => selected(c, sk.id)).map(sk => ({ id: day.date + ':' + sk.id, date: day.date, value: (sk.habitRefs || []).reduce((sum, hr) => sum + (Number((day.habitLogs || []).find(l => l.habitId === hr.habitId)?.hours) || 0) * (hr.weight ?? 1), 0) })));
+  const skillHours = (ctx, c) => ctx.days.flatMap(day => ctx.ref.skills.filter(sk => selected(c, sk.id)).map(sk => ({ id: day.date + ':' + sk.id, date: day.date, value: skillHoursForDay(sk, day) })));
   eventMetric('skill.hours', 'Часы развития навыка', 'Навыки', 'ч', 'skills', skillHours, { methods: ['sum', 'average', 'days'] });
   scalar('skill.level', 'Ступень навыка (0–7)', 'Навыки', 'ступень', 'skills', (ctx, c) => {
     const total = skillHours(ctx, c).reduce((s, e) => s + e.value, 0);
@@ -230,10 +245,13 @@ const newLevel = () => ({ id: id('level'), name: 'Новый уровень', de
 const newMap = () => ({ id: id('roadmap'), name: 'Новая дорожная карта', description: '', icon: '🗺️', color: '#7c6fda', deadline: '', startedAt: null, archived: false, levels: [newLevel()] });
 class RoadmapService {
   constructor(store, helpers = {}, clock = () => new Date()) { this.store = store; this.registry = createRegistry(helpers); this.clock = clock; this.listeners = new Set(); this.queue = Promise.resolve(); }
-  async init() {
+  async init() { return this.reload(); }
+  async reload() {
     const path = this.path();
     try {
-      this.store.roadmapsData = await this.store.a.exists(path) ? JSON.parse(await this.store.a.read(path)) : { schemaVersion: 1, maps: [] };
+      const text = await this.store.a.exists(path) ? await this.store.a.read(path) : null;
+      this.storageText = text;
+      this.store.roadmapsData = text === null ? { schemaVersion: 1, maps: [] } : JSON.parse(text);
       if (this.store.roadmapsData.schemaVersion !== 1 || !Array.isArray(this.store.roadmapsData.maps)) throw new Error('Неизвестный формат дорожных карт');
       this.loadError = null;
     } catch (error) {
@@ -264,13 +282,16 @@ class RoadmapService {
     }
     return { ref, work, rewards, courses, days, today: dateKey(this.clock()) };
   }
-  async persist(data) {
+  async persist(data, expectedText = this.storageText) {
     if (this.loadError) throw this.loadError;
-    await this.store.a.write(this.path(), JSON.stringify(data, null, 2));
-    this.store.roadmapsData = data; this.invalidate();
+    const current = await this.store.a.exists(this.path()) ? await this.store.a.read(this.path()) : null;
+    if (current !== expectedText) throw new Error('roadmaps.json изменён извне. Обновите экран и повторите действие.');
+    const text = JSON.stringify(data, null, 2);
+    await this.store.a.write(this.path(), text);
+    this.storageText = text; this.store.roadmapsData = data; this.invalidate();
   }
   transaction(fn) {
-    const job = this.queue.then(async () => { if (this.loadError) throw this.loadError; const data = clone(this.store.roadmapsData); const result = await fn(data); await this.persist(data); return result; });
+    const job = this.queue.then(async () => { await this.reload(); if (this.loadError) throw this.loadError; const expected = this.storageText; const data = clone(this.store.roadmapsData); const result = await fn(data); await this.persist(data, expected); return result; });
     this.queue = job.catch(() => {}); return job;
   }
   async saveMap(draft) {
@@ -361,6 +382,7 @@ function createRoadmapModal(Modal, Notice) {
       if (this.draft) return this.renderEditor();
       const revision = ++this.revision;
       try {
+        await this.service.reload();
         const ctx = await this.service.context();
         if (revision !== this.revision || this.draft) return;
         this.ctx = ctx; const el = this.contentEl; el.empty();
@@ -512,7 +534,7 @@ function createRoadmapModal(Modal, Notice) {
     }
   };
 }
-module.exports = { MetricRegistry, createRegistry, validateTree, evaluateCondition, evaluateTree, evaluateMap, snapshotTree, newMap, newLevel, newGroup, RoadmapService, createRoadmapModal };
+module.exports = { skillHoursForDay, MetricRegistry, createRegistry, validateTree, evaluateCondition, evaluateTree, evaluateMap, snapshotTree, newMap, newLevel, newGroup, RoadmapService, createRoadmapModal };
 
 return module.exports;
 })();
@@ -980,6 +1002,7 @@ async listDays() { try { const { files } = await this.a.list(this.base + '/journ
 
 /* ---------- Экспорт всей сохранённой истории ---------- */
 async function exportAllTime(store) {
+if (store.roadmaps) await store.roadmaps.reload();
 if (store.roadmaps?.loadError) throw store.roadmaps.loadError;
 // Читаем журнал напрямую: loadDay добавляет современные справочники к старым дням.
 // Ошибки чтения не скрываем, чтобы неполная выгрузка не выглядела успешной.
@@ -1048,7 +1071,7 @@ const exports = {
     }))
   },
   'goals-ideas-tasks-skills-rewards.json': {
-    ...meta, goals: ref.goals || [], roadmaps: store.roadmapsData || { schemaVersion: 1, maps: [] },
+    ...meta, goals: ref.goals || [],
     ideas: (store.work?.items || []).filter(item => item.kind === 'idea'),
     tasks: (store.work?.items || []).filter(item => item.kind === 'task'),
     skills: ref.skills || [], achievements: ref.achievements || [], rewards: store.rewardsData,
@@ -1057,6 +1080,7 @@ const exports = {
     })),
     skillHoursTotal: skillHoursFor(ref, days.map(day => ({ ...day, habitLogs: day.habitLogs || [] })))
   },
+  'roadmaps.json': { ...meta, ...(store.roadmapsData || { schemaVersion: 1, maps: [] }) },
   'habits.json': {
     ...meta, habits: ref.habits || [], synergyRules: ref.synergyRules || [],
     calculationNote: 'Проценты рассчитаны по сохранённым записям привычек. Пропущенный день или отсутствие привычки прерывает стрик. Калории и часы навыков рассчитаны по текущим справочникам.',
@@ -1078,7 +1102,7 @@ return folder;
 async function notifyExport(store) {
 try {
   const folder = await exportAllTime(store);
-  new Notice('Экспорт готов: 4 JSON в папке хранилища ' + folder, 15000);
+  new Notice('Экспорт готов: 5 JSON в папке хранилища ' + folder, 15000);
 } catch (error) {
   console.error('LifeTracker: ошибка экспорта', error);
   new Notice('Не удалось завершить экспорт: ' + error.message, 15000);
@@ -1116,7 +1140,7 @@ return { done, total, pct: Math.round((done / total) * 100) };
 }
 function skillHoursFor(ref, days) {
 const out = {};
-for (const sk of ref.skills) { let t = 0; for (const hr of sk.habitRefs || []) for (const d of days) { const l = d.habitLogs.find(x => x.habitId === hr.habitId); if (l && l.hours) t += l.hours * (hr.weight ?? 1); } out[sk.id] = t; }
+for (const sk of ref.skills || []) out[sk.id] = days.reduce((sum, day) => sum + LifeTrackerRoadmaps.skillHoursForDay(sk, day), 0);
 return out;
 }
 async function habitStreak(store, habitId, date) {
@@ -1182,7 +1206,7 @@ for (const d of days) {
   const day = await store.loadDay(d);
   if (g.targetType === 'skill') {
     const sk = ref.skills.find(s => s.id === g.targetId);
-    if (sk) for (const hr of sk.habitRefs || []) { const l = day.habitLogs.find(x => x.habitId === hr.habitId); if (l && l.hours) sum += l.hours * (hr.weight ?? 1); }
+    if (sk) sum += LifeTrackerRoadmaps.skillHoursForDay(sk, day);
   } else {
     for (const l of day.activityLogs) if (!g.targetId || l.activityId === g.targetId) sum += +l.amount || 0;
   }
@@ -1609,10 +1633,7 @@ el.createEl('h3', { text: '📈 Уровни навыков (текущие ча
 const hoursMap = {};
 for (const d of (await this.store.listDays())) {
   const day = await this.store.loadDay(d);
-  for (const sk of ref.skills) for (const hr of sk.habitRefs || []) {
-    const l = day.habitLogs.find(x => x.habitId === hr.habitId);
-    if (l && l.hours) hoursMap[sk.id] = (hoursMap[sk.id] || 0) + l.hours * (hr.weight ?? 1);
-  }
+  for (const sk of ref.skills) hoursMap[sk.id] = (hoursMap[sk.id] || 0) + LifeTrackerRoadmaps.skillHoursForDay(sk, day);
 }
 for (const sk of ref.skills) {
   const h = hoursMap[sk.id] || 0;
@@ -1686,12 +1707,15 @@ const r = wrap.createDiv({ cls: 'lt-row' });
 const s = r.createEl('select');
 for (const h of this.store.ref.habits) { const o = s.createEl('option', { value: h.id, text: h.name }); if (hr.habitId === h.id) o.selected = true; }
 s.addEventListener('change', () => { hr.habitId = s.value; });
-const w = r.createEl('input', { type: 'number', cls: 'lt-input', attr: { step: '0.1', min: '0', max: '1' } });
-w.value = String(hr.weight ?? 1);
-w.addEventListener('input', () => { hr.weight = +w.value || 0; });
+if (hr.habitId && !this.store.ref.habits.some(h => h.id === hr.habitId)) s.createEl('option', { value: hr.habitId, text: '(привычка удалена)' }).selected = true;
+const label = r.createEl('label'); label.createEl('span', { text: 'Часов за выполнение: ' });
+const w = label.createEl('input', { type: 'number', cls: 'lt-input', attr: { step: '0.25', min: '0', placeholder: 'По журналу' } });
+w.value = hr.hoursPerCompletion === undefined ? '' : String(hr.hoursPerCompletion);
+w.addEventListener('input', () => { if (!w.value.trim()) delete hr.hoursPerCompletion; else hr.hoursPerCompletion = Number(w.value); });
+if (hr.hoursPerCompletion === undefined) r.createEl('span', { cls: 'lt-description', text: 'Пустое поле: часы журнала × прежний вес ' + (hr.weight ?? 1) });
 r.createEl('button', { text: '✕' }).onclick = () => { this.item[k].splice(idx, 1); render(); };
 });
-wrap.createEl('button', { text: '+ связь с привычкой', cls: 'lt-add' }).onclick = () => { this.item[k].push({ habitId: this.store.ref.habits[0]?.id || '', weight: 1 }); render(); };
+wrap.createEl('button', { text: '+ связь с привычкой', cls: 'lt-add' }).onclick = () => { this.item[k].push({ habitId: this.store.ref.habits[0]?.id || '', hoursPerCompletion: 1 }); render(); };
 };
 render();
 }
@@ -1722,6 +1746,14 @@ actionsBar.createEl('span', { text: (this.isNew ? 'Новая · ' : 'Правк
 actionsBar.createEl('button', { text: 'Сохранить ✓', cls: 'mod-cta' }).onclick = async () => {
   if (this.collKey !== 'synergyRules' && !it.name) { new Notice('Нужно название'); return; }
   if (this.collKey === 'synergyRules' && (!it.source.id || !it.target.id)) { new Notice('Выбери оба конца синергии'); return; }
+  if (this.collKey === 'skills') {
+    const ids = new Set();
+    for (const link of it.habitRefs || []) {
+      if (!this.store.ref.habits.some(h => h.id === link.habitId) || ids.has(link.habitId)) { new Notice('Выберите существующие привычки без повторов'); return; }
+      ids.add(link.habitId);
+      if (link.hoursPerCompletion !== undefined && (!Number.isFinite(link.hoursPerCompletion) || link.hoursPerCompletion < 0)) { new Notice('Количество часов должно быть неотрицательным числом'); return; }
+    }
+  }
   if (this.collKey === 'goals' && it.status === 'achieved') {
     if (!it.completedAt) it.completedAt = iso(new Date());
     if (!it.completedDate) it.completedDate = it.completedAt;
@@ -2153,12 +2185,7 @@ const allDays = await this.store.listDays();
 const hoursMap = {};
 for (const d of allDays) {
   const dData = await this.store.loadDay(d);
-  for (const sk of ref.skills) {
-    for (const hr of sk.habitRefs || []) {
-      const l = dData.habitLogs.find(x => x.habitId === hr.habitId);
-      if (l && l.hours) hoursMap[sk.id] = (hoursMap[sk.id] || 0) + l.hours * (hr.weight ?? 1);
-    }
-  }
+  for (const sk of ref.skills) hoursMap[sk.id] = (hoursMap[sk.id] || 0) + LifeTrackerRoadmaps.skillHoursForDay(sk, dData);
 }
 for (const sk of ref.skills.slice(0, 5)) {
   const h = hoursMap[sk.id] || 0;
@@ -2911,6 +2938,7 @@ this.addRibbonIcon('map', 'LifeTracker: дорожные карты', this.store
 this.addCommand({ id: 'lt-roadmaps', name: 'LT: дорожные карты', callback: this.store.openRoadmaps });
 // Adapter writes notify directly; Vault events cover edits made outside the plugin.
 const metricsChanged = file => {
+  if (file?.path === this.store.roadmaps.path()) { this.store.roadmaps.reload().then(() => this.store.roadmaps.invalidate()); return; }
   if (file?.path?.startsWith(this.store.base + '/') && file.path !== this.store.roadmaps.path() && !file.path.startsWith(this.store.base + '/exports/')) this.store.roadmaps.invalidate();
 };
 for (const event of ['create', 'modify', 'delete', 'rename']) this.registerEvent(this.app.vault.on(event, metricsChanged));
