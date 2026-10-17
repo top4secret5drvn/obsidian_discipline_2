@@ -1,4 +1,4 @@
-/* LifeTracker v0.4.2 · plain JS · офлайн */
+/* LifeTracker v0.4.3 · plain JS · офлайн */
 const { Plugin, Modal, Notice, debounce } = require('obsidian');
 
 /* ROADMAPS_BUNDLE_START */
@@ -80,15 +80,15 @@ function createRegistry(h = {}) {
     const total = skillHours(ctx, c).reduce((s, e) => s + e.value, 0);
     return [10, 100, 500, 1000, 2500, 5000, 10000].filter(n => total >= n).length; // Existing eight named tiers: 0–7.
   }, { requireEntity: true, maxTarget: 7 });
-  for (const [kind, col, source] of [['task', 'tasks', 'Задачи'], ['idea', 'ideas', 'Идеи']]) {
+  for (const [kind, col, source] of [['task', 'tasks', 'Дела'], ['idea', 'ideas', 'Идеи']]) {
     scalar(kind + '.status', 'Количество элементов с выбранным статусом', source, 'шт.', col, (ctx, c) => entities(ctx, col).filter(x => selected(c, x.id) && x.status === (c.status || 'done')).length, { statuses: ['backlog', 'in_progress', 'done', 'dropped'] });
-    eventMetric(kind + '.completed', 'Завершённые ' + (kind === 'task' ? 'задачи' : 'идеи'), source, 'шт.', col, (ctx, c) => {
+    eventMetric(kind + '.completed', 'Завершённые ' + (kind === 'task' ? 'дела' : 'идеи'), source, 'шт.', col, (ctx, c) => {
       const seen = new Map();
       for (const item of entities(ctx, col)) if (selected(c, item.id) && item.status === 'done') {
         const date = item.completedDate || item.doneAt;
         if (isDate(date)) seen.set(item.id, { id: item.id, date, value: 1 });
       }
-      for (const day of ctx.days) for (const item of day.completedWorkItems || []) if (item.kind === kind && selected(c, item.id) && !seen.has(item.id)) seen.set(item.id, { id: item.id, date: day.date, value: 1 });
+      for (const day of ctx.days) for (const item of day.completedWorkItems || []) if (item.kind === kind && selected(c, item.id) && !seen.has(item.id) && !ctx.work.items.some(current => current.id === item.id && current.status !== 'done')) seen.set(item.id, { id: item.id, date: day.date, value: 1 });
       return [...seen.values()];
     }, { methods: ['count', 'days', 'event'] });
   }
@@ -244,7 +244,7 @@ const newGroup = () => ({ id: id('group'), kind: 'group', op: 'AND', children: [
 const newLevel = () => ({ id: id('level'), name: 'Новый уровень', description: '', status: 'locked', activatedAt: null, completedAt: null, conditions: newGroup() });
 const newMap = () => ({ id: id('roadmap'), name: 'Новая дорожная карта', description: '', icon: '🗺️', color: '#7c6fda', deadline: '', startedAt: null, archived: false, levels: [newLevel()] });
 class RoadmapService {
-  constructor(store, helpers = {}, clock = () => new Date()) { this.store = store; this.registry = createRegistry(helpers); this.clock = clock; this.listeners = new Set(); this.queue = Promise.resolve(); }
+  constructor(store, helpers = {}, clock = () => new Date()) { this.helpers = helpers; this.store = store; this.registry = createRegistry(helpers); this.clock = clock; this.listeners = new Set(); this.queue = Promise.resolve(); }
   async init() { return this.reload(); }
   async reload() {
     const path = this.path();
@@ -292,6 +292,25 @@ class RoadmapService {
   }
   transaction(fn) {
     const job = this.queue.then(async () => { await this.reload(); if (this.loadError) throw this.loadError; const expected = this.storageText; const data = clone(this.store.roadmapsData); const result = await fn(data); await this.persist(data, expected); return result; });
+    this.queue = job.catch(() => {}); return job;
+  }
+  setTaskDone(taskId, done) {
+    const job = this.queue.then(async () => {
+      const ctx = await this.context(), work = clone(ctx.work);
+      const task = work.items.find(item => item.id === taskId && item.kind === 'task');
+      if (!task) throw new Error('Дело удалено или недоступно');
+      if (done && task.status !== 'done' && task.minStatRequirement && (!this.helpers.canCompleteTask || !await this.helpers.canCompleteTask(task))) throw new Error('Не выполнено требование к характеристике для этого дела');
+      if (done && task.status !== 'done') {
+        task.status = 'done'; task.doneAt = ctx.today; task.completedDate = ctx.today;
+      } else if (!done && task.status === 'done') {
+        task.status = 'in_progress'; delete task.doneAt; delete task.completedDate;
+      } else return;
+      const previous = this.store.work;
+      this.store.work = work;
+      try { await this.store.saveWorkItems(); }
+      catch (error) { this.store.work = previous; throw error; }
+      this.invalidate();
+    });
     this.queue = job.catch(() => {}); return job;
   }
   async saveMap(draft) {
@@ -436,17 +455,17 @@ function createRoadmapModal(Modal, Notice) {
         box.createEl('p', { text: level.description });
         if (level.activatedAt) box.createDiv({ cls: 'lt-description', text: 'Активирован: ' + new Date(level.activatedAt).toLocaleString() });
         if (level.completedAt) box.createDiv({ cls: 'lt-description', text: 'Завершён: ' + new Date(level.completedAt).toLocaleString() + ' · Результат зафиксирован' });
-        this.renderResult(box, level.conditions, state.result, ctx);
+        this.renderResult(box, level.conditions, state.result, ctx, state.status !== 'completed');
         if (state.status === 'locked') box.createDiv({ cls: 'lt-notice', text: i ? 'Откроется после выполнения условий и подтверждения завершения предыдущего уровня. Прогресс ещё не засчитывается.' : 'Откроется после запуска карты.' });
         if (state.status === 'active') box.createDiv({ cls: 'lt-description', text: 'Выполните логическую структуру условий. Для открытия следующего уровня потребуется подтверждение.' });
         if (['active', 'ready'].includes(state.status)) this.button(box, 'Завершить уровень', () => this.service.complete(map.id, level.id), state.status !== 'ready' || map.archived);
       }
     }
-    renderResult(el, node, result, ctx) {
+    renderResult(el, node, result, ctx, editableTasks = true) {
       if (node.kind === 'group') {
         const group = el.createDiv({ cls: 'lt-rm-group' });
         group.createDiv({ text: (node.op === 'AND' ? 'Все условия (AND)' : 'Любое условие (OR)') + (result?.met ? ' ✓' : '') });
-        node.children.forEach((child, i) => this.renderResult(group, child, result?.children?.[i], ctx)); return;
+        node.children.forEach((child, i) => this.renderResult(group, child, result?.children?.[i], ctx, editableTasks)); return;
       }
       const metric = this.service.registry.get(node.metric);
       const row = el.createDiv({ cls: 'lt-rm-condition' });
@@ -457,6 +476,22 @@ function createRoadmapModal(Modal, Notice) {
       row.createDiv({ cls: 'lt-description', text: `${MODES[node.mode]} · ${METHODS[node.method]}${node.from ? ' · с ' + node.from : ''}${node.to ? ' · по ' + node.to : ''}` });
       if (result?.percent != null) this.progress(row, result.percent);
       if (result?.message) row.createDiv({ cls: 'lt-notice', text: result.message });
+      if (editableTasks && node.metric.startsWith('task.')) {
+        const tasks = ctx.work.items.filter(item => item.kind === 'task' && (!node.entityId || item.id === node.entityId));
+        for (const task of tasks) {
+          const label = row.createEl('label', { cls: 'lt-row' });
+          const check = label.createEl('input', { type: 'checkbox' }); check.checked = task.status === 'done';
+          label.createEl('span', { text: task.name || '(без названия)' });
+          check.onchange = async () => {
+            if (this.busy) { check.checked = task.status === 'done'; return; }
+            this.busy = true; check.disabled = true;
+            try { await this.service.setTaskDone(task.id, check.checked); }
+            catch (error) { new Notice(error.message, 10000); }
+            finally { this.busy = false; await this.render(); }
+          };
+        }
+        if (!result) row.createDiv({ cls: 'lt-description', text: 'Отметка меняет само дело. Выполнение до активации уровня не засчитывается в режим «После активации».' });
+      }
     }
     renderEditor() {
       ++this.revision;
@@ -491,6 +526,27 @@ function createRoadmapModal(Modal, Notice) {
       this.button(bar, '↓', () => { [array[index + 1], array[index]] = [array[index], array[index + 1]]; this.renderEditor(); }, index === array.length - 1);
       this.button(bar, 'Убрать', () => { array.splice(index, 1); this.renderEditor(); });
     }
+    renderTaskPicker(parent, group) {
+      const box = parent.createDiv({ cls: 'lt-rm-card' });
+      box.createEl('strong', { text: 'Выберите дела для уровня' });
+      const selected = new Set();
+      const tasks = this.ctx.work.items.filter(item => item.kind === 'task');
+      if (!tasks.length) box.createEl('p', { text: 'Дел пока нет. Добавьте их в разделе «Дела и идеи».' });
+      for (const task of tasks) {
+        const label = box.createEl('label', { cls: 'lt-row' });
+        const check = label.createEl('input', { type: 'checkbox' });
+        label.createEl('span', { text: task.name || '(без названия)' });
+        check.onchange = () => { if (check.checked) selected.add(task.id); else selected.delete(task.id); };
+      }
+      this.button(box, 'Добавить выбранные дела', () => {
+        for (const taskId of selected) {
+          if (group.children.some(c => c.kind === 'condition' && c.metric === 'task.completed' && c.entityId === taskId)) continue;
+          group.children.push({ id: id('condition'), kind: 'condition', name: '', metric: 'task.completed', entityId: taskId, method: 'event', mode: 'since_activation', operator: '>=', target: 1 });
+        }
+        this.renderEditor();
+      });
+      this.button(box, 'Отмена выбора', () => this.renderEditor());
+    }
     defaultCondition() {
       const metric = this.service.registry.list()[0];
       return { id: id('condition'), kind: 'condition', name: '', metric: metric.key, method: metric.methods[0], mode: 'since_activation', entityId: '', operator: '>=', target: 1 };
@@ -502,6 +558,7 @@ function createRoadmapModal(Modal, Notice) {
         node.children.forEach((child, index) => {
           const wrap = group.createDiv(); this.reorder(wrap, node.children, index); this.renderTreeEditor(wrap, child, depth + 1);
         });
+        this.button(group, '+ Дела', () => this.renderTaskPicker(group, node));
         this.button(group, '+ Условие', () => { node.children.push(this.defaultCondition()); this.renderEditor(); });
         this.button(group, '+ Группа AND/OR', () => { node.children.push(newGroup()); this.renderEditor(); }, depth >= 10);
         return;
@@ -944,7 +1001,7 @@ if (!await this.a.exists(cp)) {
   await this.saveCourses();
 }
 const { RoadmapService } = LifeTrackerRoadmaps;
-this.roadmaps = new RoadmapService(this, { computeDayXP, getPlayerLevel, computeDayStats, computeCourseStats, courseXPTotal, courseProgress, dayCompletion, rewardTotals, STATS, STATES });
+this.roadmaps = new RoadmapService(this, { computeDayXP, getPlayerLevel, computeDayStats, computeCourseStats, courseXPTotal, courseProgress, dayCompletion, rewardTotals, STATS, STATES, canCompleteTask: async task => checkStatRequirement(task, computeDayStats(this.ref, await this.loadDay(iso(new Date()))).stats) });
 await this.roadmaps.init();
 }
 dayPath(d) { return this.base + '/journal/' + d + '.json'; }

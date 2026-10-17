@@ -268,3 +268,39 @@ test('separate roadmap JSON is reread, updated and protected against stale write
   await assert.rejects(f.service.transaction(async () => { f.files.set('LifeTracker/roadmaps.json', JSON.stringify({ ...external, changed: true })); }), /изменён извне/);
   assert.equal(JSON.parse(f.files.get('LifeTracker/roadmaps.json')).changed, true);
 });
+test('task picker selects several existing tasks and live checkboxes update their real statuses', async () => {
+  const f = fixture(); await f.service.init();
+  f.store.work.items.push({ id: 't2', name: 'Find direction', kind: 'task', status: 'backlog' });
+  f.store.saveWorkItems = async () => f.files.set('LifeTracker/workItems.json', JSON.stringify(f.store.work));
+  const notices = [], UI = createRoadmapModal(class { constructor() { this.contentEl = new Element(); } }, class { constructor(text) { notices.push(text); } });
+  const modal = new UI({}, f.service); await modal.render(); await button(modal, '+ Создать').onclick(); await button(modal, '+ Дела').onclick();
+  const picker = modal.contentEl.all().find(e => e.children.some(c => c.text === 'Выберите дела для уровня'));
+  const picks = picker.all().filter(e => e.tag === 'input'); assert.equal(picks.length, 2, 'ideas are not tasks');
+  for (const check of picks) { check.checked = true; check.onchange(); }
+  await button(modal, 'Добавить выбранные дела').onclick();
+  assert.equal(modal.draft.levels[0].conditions.children.length, 2);
+  await button(modal, 'Сохранить').onclick(); await button(modal, 'Запустить дорожную карту').onclick(); await modal.render();
+  let checks = modal.contentEl.all().filter(e => e.tag === 'input'); checks[0].checked = true; await checks[0].onchange();
+  assert.equal(f.store.work.items.find(x => x.id === 't').status, 'done');
+  assert.equal(f.store.work.items.find(x => x.id === 't').completedDate, '2026-10-01');
+  assert.equal(button(modal, 'Завершить уровень').disabled, true);
+  checks = modal.contentEl.all().filter(e => e.tag === 'input'); checks[1].checked = true; await checks[1].onchange();
+  assert.equal(button(modal, 'Завершить уровень').disabled, false);
+  checks = modal.contentEl.all().filter(e => e.tag === 'input'); checks[0].checked = false; await checks[0].onchange();
+  assert.equal(f.store.work.items.find(x => x.id === 't').status, 'in_progress');
+  assert.equal(button(modal, 'Завершить уровень').disabled, true); assert.deepEqual(notices, []);
+});
+test('task marking respects requirements, write failures and removal; undone tasks do not count from old journal copies', async () => {
+  const f = fixture(); await f.service.init(); f.store.work.items[0].minStatRequirement = { stat: 'intelligence', threshold: 5 };
+  f.store.saveWorkItems = async () => f.files.set('LifeTracker/workItems.json', JSON.stringify(f.store.work));
+  await assert.rejects(f.service.setTaskDone('t', true), /характеристике/);
+  f.service.helpers.canCompleteTask = async () => true; await f.service.setTaskDone('t', true);
+  f.put('2026-10-01', { completedWorkItems: [{ id: 't', kind: 'task' }] });
+  await f.service.setTaskDone('t', false);
+  const value = evaluateCondition(condition('task.completed', { entityId: 't', method: 'event', mode: 'absolute' }), {}, f.service.registry, await f.service.context());
+  assert.equal(value.value, 0);
+  f.store.saveWorkItems = async () => { throw new Error('disk full'); };
+  await assert.rejects(f.service.setTaskDone('t', true), /disk full/); assert.equal(f.store.work.items[0].status, 'in_progress');
+  await assert.rejects(f.service.setTaskDone('missing', true), /удалено/);
+  await assert.rejects(f.service.setTaskDone('i', true), /удалено/);
+});
