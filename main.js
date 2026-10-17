@@ -1,4 +1,4 @@
-/* LifeTracker v0.4.1 · plain JS · офлайн */
+/* LifeTracker v0.4.2 · plain JS · офлайн */
 const { Plugin, Modal, Notice, debounce } = require('obsidian');
 
 /* ROADMAPS_BUNDLE_START */
@@ -1620,7 +1620,7 @@ for (const [key, label, fmt] of cols) {
     row.createEl('span', { cls: 'lt-name', text: fmt(item) || '(без имени)' });
     const sub = subline(ref, key, item);
     if (sub) row.createEl('span', { cls: 'lt-chip', text: sub });
-    row.createEl('button', { text: '✎' }).onclick = () => new EditModal(this.app, this.store, key, item, () => this.render()).open();
+    row.createEl('button', { text: key === 'skills' ? 'Редактировать навык' : '✎' }).onclick = () => new EditModal(this.app, this.store, key, item, () => this.render()).open();
     const del = row.createEl('button', { text: '🗑' });
     del.onclick = () => {
       if (del.dataset.arm) { this.store.ref[key] = this.store.ref[key].filter(x => x.id !== item.id); this.store.saveRef(); this.render(); }
@@ -1644,6 +1644,8 @@ for (const sk of ref.skills) {
   row.createEl('span', { cls: 'lt-chip', text: fmtH(h) + ' / ' + lv.to + ' ч' });
   const bar = row.createDiv({ cls: 'lt-bar' });
   bar.createDiv({ cls: 'lt-bar-fill', attr: { style: `width:${skillProgress(h)}%` } });
+  row.createEl('button', { text: 'Редактировать навык' }).onclick = () => new EditModal(this.app, this.store, 'skills', sk, () => this.render()).open();
+  renderSkillHoursForm(el, this.store, sk, () => this.render());
 }
 el.createEl('h3', { text: '🏆 Достижения' });
 for (const a of (ref.achievements || []).slice().reverse()) {
@@ -1658,6 +1660,38 @@ for (const a of (ref.achievements || []).slice().reverse()) {
 }
 el.createEl('button', { text: '+ добавить достижение', cls: 'lt-add' }).onclick = () => new AchievementEditModal(this.app, this.store, () => this.render()).open();
 }
+}
+
+/* Быстрая настройка часов прямо в справочнике, отдельно для каждого навыка. */
+function renderSkillHoursForm(parent, store, skill, onSaved) {
+const wrap = parent.createDiv({ cls: 'lt-skill-hours' });
+const original = JSON.stringify(skill.habitRefs || []);
+const links = JSON.parse(original);
+if (!links.length) { wrap.createDiv({ cls: 'lt-description', text: 'Связанных привычек нет. Нажмите «Редактировать навык», чтобы добавить их.' }); return; }
+wrap.createDiv({ cls: 'lt-description', text: 'Часы за одно выполнение каждой привычки. Пустое поле сохраняет расчёт по журналу. Изменения пересчитают накопленные часы.' });
+for (const link of links) {
+  const habit = store.ref.habits.find(h => h.id === link.habitId);
+  const label = wrap.createEl('label', { cls: 'lt-row' });
+  label.createEl('span', { cls: 'lt-name', text: habit?.name || '(привычка удалена)' });
+  label.createEl('span', { text: 'Часов за выполнение' });
+  const input = label.createEl('input', { type: 'number', cls: 'lt-input', attr: { min: '0', step: 'any', inputmode: 'decimal', placeholder: 'По журналу' } });
+  input.value = link.hoursPerCompletion === undefined ? '' : String(link.hoursPerCompletion);
+  input.disabled = !habit;
+  input.addEventListener('input', () => { if (!input.value.trim()) delete link.hoursPerCompletion; else link.hoursPerCompletion = Number(input.value); });
+}
+const save = wrap.createEl('button', { text: 'Сохранить часы · ' + skill.name });
+save.onclick = async () => {
+  if (links.some(link => link.hoursPerCompletion !== undefined && (!Number.isFinite(link.hoursPerCompletion) || link.hoursPerCompletion < 0))) { new Notice('Количество часов должно быть неотрицательным числом'); return; }
+  const current = store.ref.skills.find(s => s.id === skill.id);
+  if (!current || JSON.stringify(current.habitRefs || []) !== original) { new Notice('Навык изменён. Откройте справочник заново перед сохранением.'); return; }
+  save.disabled = true;
+  const previous = current.habitRefs;
+  current.habitRefs = JSON.parse(JSON.stringify(links));
+  try { await store.saveRef(); }
+  catch (error) { current.habitRefs = previous; save.disabled = false; new Notice('Не удалось сохранить часы: ' + error.message); return; }
+  save.disabled = false;
+  new Notice('Часы навыка сохранены ✓'); await onSaved();
+};
 }
 
 /* ---------- конструктор форм ---------- */
@@ -1709,7 +1743,7 @@ for (const h of this.store.ref.habits) { const o = s.createEl('option', { value:
 s.addEventListener('change', () => { hr.habitId = s.value; });
 if (hr.habitId && !this.store.ref.habits.some(h => h.id === hr.habitId)) s.createEl('option', { value: hr.habitId, text: '(привычка удалена)' }).selected = true;
 const label = r.createEl('label'); label.createEl('span', { text: 'Часов за выполнение: ' });
-const w = label.createEl('input', { type: 'number', cls: 'lt-input', attr: { step: '0.25', min: '0', placeholder: 'По журналу' } });
+const w = label.createEl('input', { type: 'number', cls: 'lt-input', attr: { step: 'any', min: '0', inputmode: 'decimal', placeholder: 'По журналу' } });
 w.value = hr.hoursPerCompletion === undefined ? '' : String(hr.hoursPerCompletion);
 w.addEventListener('input', () => { if (!w.value.trim()) delete hr.hoursPerCompletion; else hr.hoursPerCompletion = Number(w.value); });
 if (hr.hoursPerCompletion === undefined) r.createEl('span', { cls: 'lt-description', text: 'Пустое поле: часы журнала × прежний вес ' + (hr.weight ?? 1) });
