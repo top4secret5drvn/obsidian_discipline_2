@@ -188,7 +188,7 @@ test('integration uses actual LifeTracker calculations, Store hooks, export and 
   const dirs = new Set(); f.store.a.mkdir = async path => dirs.add(path);
   const oldExists = f.store.a.exists; f.store.a.exists = async path => dirs.has(path) || oldExists(path);
   const folder = await helpers.exportAllTime(f.store);
-  assert.equal(JSON.parse(f.files.get(folder + '/goals-ideas-tasks-skills-rewards.json')).roadmaps.schemaVersion, 1);
+  assert.equal(JSON.parse(f.files.get(folder + '/roadmaps.json')).schemaVersion, 1);
   const store = new helpers.Store({ vault: { adapter: f.store.a } });
   store.cache['2026-10-01'] = { date: '2026-10-01' }; let invalidated = 0;
   store.roadmaps = { invalidate: () => invalidated++ };
@@ -241,4 +241,30 @@ test('corrupt roadmap storage stays untouched and cannot be overwritten as an em
   await assert.rejects(f.service.saveMap(newMap()), /roadmaps.json/);
   await assert.rejects(f.service.context(), /roadmaps.json/);
   assert.equal(f.files.get('LifeTracker/roadmaps.json'), '{broken');
+});
+test('skill hours per completion replace manual time, support fractions and zero, and keep legacy links', async () => {
+  const { skillHoursForDay } = require('../roadmaps');
+  const day = { habitLogs: [{ habitId: 'h', done: true, hours: 20 }] };
+  assert.equal(skillHoursForDay({ habitRefs: [{ habitId: 'h', hoursPerCompletion: 0.5, weight: 0.1 }] }, day), 0.5);
+  assert.equal(skillHoursForDay({ habitRefs: [{ habitId: 'h', hoursPerCompletion: 0 }] }, day), 0);
+  assert.equal(skillHoursForDay({ habitRefs: [{ habitId: 'h', weight: 0.5 }] }, day), 10);
+  assert.equal(skillHoursForDay({ habitRefs: [{ habitId: 'h', hoursPerCompletion: 2 }, { habitId: 'h', hoursPerCompletion: 2 }] }, day), 2);
+  day.habitLogs[0].done = false;
+  assert.equal(skillHoursForDay({ habitRefs: [{ habitId: 'h', hoursPerCompletion: 2 }] }, day), 0);
+  const f = fixture(); await f.service.init(); f.store.ref.skills[0].habitRefs[0].hoursPerCompletion = 10;
+  f.put('2026-10-01', { habitLogs: [{ habitId: 'h', done: true }] });
+  const ctx = await f.service.context();
+  assert.equal(evaluateCondition(condition('skill.hours', { entityId: 'sk', mode: 'absolute' }), {}, f.service.registry, ctx).value, 10);
+  assert.equal(evaluateCondition(condition('skill.level', { entityId: 'sk', mode: 'absolute', method: 'absolute' }), {}, f.service.registry, ctx).value, 1);
+});
+test('separate roadmap JSON is reread, updated and protected against stale writes', async () => {
+  const f = fixture(); await f.service.init(); const map = newMap(); map.levels[0].conditions.children = [condition('habit.done')];
+  await f.service.saveMap(map);
+  const external = JSON.parse(f.files.get('LifeTracker/roadmaps.json')); external.maps[0].name = 'External edit';
+  f.files.set('LifeTracker/roadmaps.json', JSON.stringify(external)); await f.service.reload();
+  assert.equal(f.service.maps[0].name, 'External edit');
+  await f.service.archive(map.id);
+  assert.equal(JSON.parse(f.files.get('LifeTracker/roadmaps.json')).maps[0].name, 'External edit');
+  await assert.rejects(f.service.transaction(async () => { f.files.set('LifeTracker/roadmaps.json', JSON.stringify({ ...external, changed: true })); }), /изменён извне/);
+  assert.equal(JSON.parse(f.files.get('LifeTracker/roadmaps.json')).changed, true);
 });

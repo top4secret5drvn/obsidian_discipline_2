@@ -20,6 +20,21 @@ class MetricRegistry {
   get(key) { return this.metrics.get(key); }
   list() { return [...this.metrics.values()]; }
 }
+function skillHoursForDay(skill, day) {
+  const seen = new Set();
+  return (skill.habitRefs || []).reduce((sum, link) => {
+    if (seen.has(link.habitId)) return sum;
+    seen.add(link.habitId);
+    const log = (day.habitLogs || []).find(l => l.habitId === link.habitId);
+    if (!log) return sum;
+    if (link.hoursPerCompletion !== undefined) {
+      return sum + (log.done && Number.isFinite(link.hoursPerCompletion) && link.hoursPerCompletion >= 0 ? link.hoursPerCompletion : 0);
+    }
+    // Legacy links keep manual logged hours and their previous weight.
+    const hours = Number(log.hours) || 0, weight = link.weight ?? 1;
+    return sum + (Number.isFinite(weight) ? Math.max(0, hours) * Math.max(0, weight) : 0);
+  }, 0);
+}
 function createRegistry(h = {}) {
   const r = new MetricRegistry();
   const entities = (ctx, collection) => collection === 'tasks' || collection === 'ideas'
@@ -53,7 +68,7 @@ function createRegistry(h = {}) {
     eventMetric('finance.' + type, label, 'Финансы', '₽', 'finCategories', (ctx, c) => finance(type, ctx, c), { methods: ['sum', 'average'], entities: ctx => ctx.ref.finCategories.filter(x => type === 'balance' || x.type === type), signed: type === 'balance' });
   }
   if (h.dayCompletion) eventMetric('habit.completion', 'Дневной процент выполнения привычек', 'Привычки', '%', null, ctx => ctx.days.map(d => ({ id: d.date, date: d.date, value: h.dayCompletion(ctx.ref, d).pct })), { methods: ['average'] });
-  const skillHours = (ctx, c) => ctx.days.flatMap(day => ctx.ref.skills.filter(sk => selected(c, sk.id)).map(sk => ({ id: day.date + ':' + sk.id, date: day.date, value: (sk.habitRefs || []).reduce((sum, hr) => sum + (Number((day.habitLogs || []).find(l => l.habitId === hr.habitId)?.hours) || 0) * (hr.weight ?? 1), 0) })));
+  const skillHours = (ctx, c) => ctx.days.flatMap(day => ctx.ref.skills.filter(sk => selected(c, sk.id)).map(sk => ({ id: day.date + ':' + sk.id, date: day.date, value: skillHoursForDay(sk, day) })));
   eventMetric('skill.hours', 'Часы развития навыка', 'Навыки', 'ч', 'skills', skillHours, { methods: ['sum', 'average', 'days'] });
   scalar('skill.level', 'Ступень навыка (0–7)', 'Навыки', 'ступень', 'skills', (ctx, c) => {
     const total = skillHours(ctx, c).reduce((s, e) => s + e.value, 0);
@@ -224,10 +239,13 @@ const newLevel = () => ({ id: id('level'), name: 'Новый уровень', de
 const newMap = () => ({ id: id('roadmap'), name: 'Новая дорожная карта', description: '', icon: '🗺️', color: '#7c6fda', deadline: '', startedAt: null, archived: false, levels: [newLevel()] });
 class RoadmapService {
   constructor(store, helpers = {}, clock = () => new Date()) { this.store = store; this.registry = createRegistry(helpers); this.clock = clock; this.listeners = new Set(); this.queue = Promise.resolve(); }
-  async init() {
+  async init() { return this.reload(); }
+  async reload() {
     const path = this.path();
     try {
-      this.store.roadmapsData = await this.store.a.exists(path) ? JSON.parse(await this.store.a.read(path)) : { schemaVersion: 1, maps: [] };
+      const text = await this.store.a.exists(path) ? await this.store.a.read(path) : null;
+      this.storageText = text;
+      this.store.roadmapsData = text === null ? { schemaVersion: 1, maps: [] } : JSON.parse(text);
       if (this.store.roadmapsData.schemaVersion !== 1 || !Array.isArray(this.store.roadmapsData.maps)) throw new Error('Неизвестный формат дорожных карт');
       this.loadError = null;
     } catch (error) {
@@ -258,13 +276,16 @@ class RoadmapService {
     }
     return { ref, work, rewards, courses, days, today: dateKey(this.clock()) };
   }
-  async persist(data) {
+  async persist(data, expectedText = this.storageText) {
     if (this.loadError) throw this.loadError;
-    await this.store.a.write(this.path(), JSON.stringify(data, null, 2));
-    this.store.roadmapsData = data; this.invalidate();
+    const current = await this.store.a.exists(this.path()) ? await this.store.a.read(this.path()) : null;
+    if (current !== expectedText) throw new Error('roadmaps.json изменён извне. Обновите экран и повторите действие.');
+    const text = JSON.stringify(data, null, 2);
+    await this.store.a.write(this.path(), text);
+    this.storageText = text; this.store.roadmapsData = data; this.invalidate();
   }
   transaction(fn) {
-    const job = this.queue.then(async () => { if (this.loadError) throw this.loadError; const data = clone(this.store.roadmapsData); const result = await fn(data); await this.persist(data); return result; });
+    const job = this.queue.then(async () => { await this.reload(); if (this.loadError) throw this.loadError; const expected = this.storageText; const data = clone(this.store.roadmapsData); const result = await fn(data); await this.persist(data, expected); return result; });
     this.queue = job.catch(() => {}); return job;
   }
   async saveMap(draft) {
@@ -355,6 +376,7 @@ function createRoadmapModal(Modal, Notice) {
       if (this.draft) return this.renderEditor();
       const revision = ++this.revision;
       try {
+        await this.service.reload();
         const ctx = await this.service.context();
         if (revision !== this.revision || this.draft) return;
         this.ctx = ctx; const el = this.contentEl; el.empty();
@@ -506,4 +528,4 @@ function createRoadmapModal(Modal, Notice) {
     }
   };
 }
-module.exports = { MetricRegistry, createRegistry, validateTree, evaluateCondition, evaluateTree, evaluateMap, snapshotTree, newMap, newLevel, newGroup, RoadmapService, createRoadmapModal };
+module.exports = { skillHoursForDay, MetricRegistry, createRegistry, validateTree, evaluateCondition, evaluateTree, evaluateMap, snapshotTree, newMap, newLevel, newGroup, RoadmapService, createRoadmapModal };
