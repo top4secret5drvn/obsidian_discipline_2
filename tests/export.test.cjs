@@ -21,7 +21,7 @@ test('exports all four groups, dates, unknown IDs and weighted skill hours witho
   const journal = [...data.entries()];
   const folder = await run(store);
   const read = name => JSON.parse(data.get(folder + '/' + name));
-  assert.equal([...data.keys()].filter(p => p.startsWith(folder + '/')).length, 4);
+  assert.equal([...data.keys()].filter(p => p.startsWith(folder + '/')).length, 5);
   const finance = read('finances.json');
   assert.deepEqual(finance.period, { from: '2024-12-31', to: '2025-01-02' });
   assert.equal(finance.days[0].entries[0].type, 'expense');
@@ -91,4 +91,14 @@ test('streaks continue beyond 365 days', async () => {
   const habits = JSON.parse(data.get(folder + '/habits.json'));
   assert.equal(habits.summary[0].longestStreak, 400);
   assert.equal(habits.days[399].habits[0].streak, 400);
+});
+test('roadmaps export separately and configured completion hours replace weighted manual hours', async () => {
+  const { store, data, run } = fixture();
+  store.ref.skills[0].habitRefs[0].hoursPerCompletion = 0.75;
+  store.roadmapsData = { schemaVersion: 1, maps: [{ id: 'road', name: 'Map', levels: [] }] };
+  const folder = await run(store);
+  const progress = JSON.parse(data.get(folder + '/goals-ideas-tasks-skills-rewards.json'));
+  assert.equal(progress.skillHoursTotal.sk1, 0.75);
+  assert.equal(progress.roadmaps, undefined);
+  assert.equal(JSON.parse(data.get(folder + '/roadmaps.json')).maps[0].id, 'road');
 });
