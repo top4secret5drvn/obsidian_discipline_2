@@ -2449,13 +2449,20 @@ navBtn('▶', () => { targetDate = iso(addDays(parseISO(targetDate), 1)); rerend
 navBtn('⌂ сегодня', () => { targetDate = iso(new Date()); rerender(); });
 
 line(`┌─ ДЕНЬ · ${targetDate} · ${WD[(parseISO(targetDate).getDay() + 6) % 7]} · 🎯 ${c.pct}% (${c.done}/${c.total}) ─────`, 'lt-a-head');
-line('│ ПРИВЫЧКИ', 'lt-a-sec');
+const habitGroups = [
+  { title: 'ОБЯЗАТЕЛЬНЫЕ ПРИВЫЧКИ', habits: ref.habits.filter(isRequiredHabit) },
+  { title: 'ДОПОЛНИТЕЛЬНЫЕ ПРИВЫЧКИ', habits: ref.habits.filter(h => !isRequiredHabit(h)) }
+];
 const wH = Math.max(10, ...ref.habits.map(h => h.name.length)) + 1;
-for (const h of ref.habits) {
+for (const group of habitGroups) {
+line('│ ' + group.title, 'lt-a-sec');
+if (!group.habits.length) line('│  —');
+for (const h of group.habits) {
   const l = day.habitLogs.find(x => x.habitId === h.id);
   const streak = await habitStreak(store, h.id, targetDate);
   const eff = fmtStats(h.baseEffects);
   line(`│  [${l.done ? '✓' : ' '}] ${pad(h.name, wH)}${eff === '—' ? '' : eff + '  '}${fmtH(l.hours || 0)}${streak ? '  🔥' + streak : ''}`);
+}
 }
 if (ref.substances.length) {
   line('│ ВЕЩЕСТВА', 'lt-a-sec');
@@ -2495,9 +2502,11 @@ const act = fn => async () => { fn(); await saveNow(); await rerender(); };
 const bigBtn = (parent, txt, fn) => { const b = parent.createEl('button', { cls: 'lt-big-btn', text: txt }); b.onclick = act(fn); return b; };
 const head = t => touch.createEl('h4', { text: t });
 
-head('Привычки');
 touch.createDiv({ cls: 'lt-chip', text: habitGateText(ref, day) });
-for (const h of ref.habits) {
+for (const group of habitGroups) {
+head(group.title);
+if (!group.habits.length) touch.createDiv({ text: '—' });
+for (const h of group.habits) {
   const l = day.habitLogs.find(x => x.habitId === h.id);
   const row = touch.createDiv({ cls: 'lt-touch-row' });
   const cb = row.createEl('input', { type: 'checkbox', cls: 'lt-big-check' });
@@ -2505,6 +2514,7 @@ for (const h of ref.habits) {
   updateHabitControl(cb, ref, day, h);
   cb.onchange = act(() => { if (!setHabitDone(ref, day, h, cb.checked)) new Notice(habitGateText(ref, day)); });
   row.createEl('span', { cls: 'lt-touch-name', text: h.name });
+}
 }
 if (ref.substances.length) {
   head('Вещества');
